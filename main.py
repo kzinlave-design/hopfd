@@ -1,18 +1,21 @@
-# main.py — Crusty Search (monolith, fixed + free-hosting optimized)
+# main.py — Crusty Search (monolith, persistent FSM, chain hotfix)
 import threading
 from flask import Flask
-import asyncio, aiosqlite, random, re, os, sys, logging, json, hashlib, signal, time
+import asyncio, aiosqlite, random, re, os, sys, logging, json, hashlib, signal, time, pickle
 import aiohttp
 import ssl as _ssl
 from html import escape as html_escape
 from datetime import datetime, timedelta
+from typing import Any, Dict, Optional
+
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardButton,
     InlineKeyboardMarkup, FSInputFile, InputMediaPhoto)
-from aiogram.filters import CommandStart, StateFilter
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramConflictError
 
@@ -21,16 +24,18 @@ _ssl_ctx.check_hostname = False
 _ssl_ctx.verify_mode = _ssl.CERT_NONE
 
 BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
-MAIN_MENU_IMAGE = os.path.join(BASE_DIR, "main.png")
-PROFILE_IMAGE = os.path.join(BASE_DIR, "profile.png")
-SHOP_IMAGE = os.path.join(BASE_DIR, "shop.png")
-FUNCTIONAL_IMAGE = os.path.join(BASE_DIR, "functional.png")
-DB_PATH = os.path.join(BASE_DIR, "bot.db")
-LOCK_PATH = os.path.join(BASE_DIR, ".bot.lock")
+MAIN_MENU_IMAGE   = os.path.join(BASE_DIR, "main.png")
+PROFILE_IMAGE     = os.path.join(BASE_DIR, "profile.png")
+SHOP_IMAGE        = os.path.join(BASE_DIR, "shop.png")
+FUNCTIONAL_IMAGE  = os.path.join(BASE_DIR, "functional.png")
+CHAIN_HTML_PATH   = os.path.join(BASE_DIR, "chain.html")     # опционально
+DB_PATH           = os.path.join(BASE_DIR, "bot.db")
+FSM_DB_PATH       = os.path.join(BASE_DIR, "fsm.db")
+LOCK_PATH         = os.path.join(BASE_DIR, ".bot.lock")
 
-BOT_NAME = "Crusty Search"
+BOT_NAME  = "Crusty Search"
 API_TOKEN = "8863973446:AAGaecUPFV03k_jvNw_NVAvEIa0YoH7TYpw"
-ADMINS = [8292372344, 7146758056, 8708165470]
+ADMINS    = [8292372344, 7146758056, 8708165470]
 
 CHANNELS = [
     {"id": -1004389665536, "url": "https://t.me/B2L3NC1AGA", "name": "B2L3NC1AGA"},
@@ -38,7 +43,7 @@ CHANNELS = [
 ]
 
 BOT_USERNAME = "CrustySearchBot"
-BOT_LINK = "https://t.me/CrustySearch"
+BOT_LINK     = "https://t.me/CrustySearch"
 
 E_LINK       = "6028171274939797252"
 E_FUNCTIONAL = "5850309953293653168"
@@ -71,10 +76,10 @@ RES = {
 }
 
 API_BASE = "https://api.depsearch.pro"
-API_KEY = "rVCp0AQcXJsS8fr1KPyzkCGs86DGeZb9"
+API_KEY  = "rVCp0AQcXJsS8fr1KPyzkCGs86DGeZb9"
 
-CARD_NUMBER = "2200 7021 7923 2868"
-CARD_HOLDER = "ПАВЕЛ Д"
+CARD_NUMBER   = "2200 7021 7923 2868"
+CARD_HOLDER   = "ПАВЕЛ Д"
 BTC_ADDRESS   = "1HYyHSyWFybCrmbBHVzmVLV7Dr9JpEHigS"
 TRC20_ADDRESS = "TNx7yzrfzWPu8YiC8ZJqooA844UsrdEGD4"
 USDT_ADDRESS  = "EQBAjphav1zeeYFw6LB5K7JMLaj8OV3wt9eoEf_7z3hikrck"
@@ -91,9 +96,9 @@ TARIFF_INFO = {
 RUB_PER_USD = 90.0
 CRYPTO_RATES = {"USDT": 1.0, "BTC": 60000.0, "TON": 5.0}
 REF_QUERIES_PERCENT = 25
-REF_MONEY_PERCENT = 20
+REF_MONEY_PERCENT   = 20
 DAILY_BONUS_QUERIES = 2
-BOT_CREATE_BONUS = 5
+BOT_CREATE_BONUS    = 5
 
 SELF_LOOKUP_SALT = "crusty_self_lookup_salt_v1_2026"
 
@@ -102,14 +107,11 @@ STARS_ADMINS = [
     {"name": "2 Админ", "username": "swatlolz"},
 ]
 
-# ============================================================
-# OPTIMIZATION CONSTANTS (free-hosting)
-# ============================================================
-POLLING_RETRY_DELAY   = 5.0     # базовая пауза перед retry
-POLLING_MAX_RETRIES   = 10      # максимум попыток
-POLLING_PRE_DELAY     = 1.5     # пауза после delete_webhook
-BROADCAST_CONCURRENCY = 5       # параллельных отправок
-BROADCAST_SLEEP       = 0.08    # пауза между отправками
+POLLING_RETRY_DELAY   = 5.0
+POLLING_MAX_RETRIES   = 10
+POLLING_PRE_DELAY     = 1.5
+BROADCAST_CONCURRENCY = 5
+BROADCAST_SLEEP       = 0.08
 HTTP_LIMIT            = 40
 HTTP_LIMIT_PER_HOST   = 10
 HTTP_TTL_DNS          = 180
@@ -119,8 +121,6 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 # ==== Render.com health-check ====
-from flask import Flask  # добавьте в импорты сверху, а не здесь
-
 web_app = Flask(__name__)
 
 @web_app.route('/')
@@ -139,18 +139,14 @@ def acquire_single_instance_lock():
         if os.name == "nt":
             import msvcrt
             fh = open(LOCK_PATH, "a+b")
-            try:
-                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError:
-                fh.close(); return False
+            try: msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError: fh.close(); return False
             _MAIN_LOCK_HANDLE = fh
         else:
             import fcntl
             fh = open(LOCK_PATH, "a+b")
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                fh.close(); return False
+            try: fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError: fh.close(); return False
             _MAIN_LOCK_HANDLE = fh
         return True
     except Exception as ex:
@@ -193,10 +189,155 @@ def fmt_crypto(a, c):
 
 
 # ============================================================
-# HTTP — как браузер
+# FSM STORAGE — persistent (Redis если есть, иначе SQLite)
+# ============================================================
+class SQLiteStorage(BaseStorage):
+    """Простое persistent-хранилище FSM поверх SQLite (fsm.db)."""
+
+    def __init__(self, path: str = FSM_DB_PATH):
+        self.path = path
+        self._ready = False
+
+    async def _connect(self):
+        db = await aiosqlite.connect(self.path)
+        if not self._ready:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout=8000")
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS fsm_storage ("
+                "  key TEXT PRIMARY KEY,"
+                "  state TEXT,"
+                "  data BLOB,"
+                "  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                ")"
+            )
+            await db.commit()
+            self._ready = True
+        return db
+
+    @staticmethod
+    def _key_str(key: StorageKey) -> str:
+        return f"{key.bot_id}:{key.chat_id}:{key.user_id}:{key.destiny}"
+
+    async def set_state(self, key: StorageKey, state: StateType = None) -> None:
+        state_str = state.state if isinstance(state, State) else (state or "")
+        k = self._key_str(key)
+        db = await self._connect()
+        try:
+            await db.execute(
+                "INSERT INTO fsm_storage (key, state) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET state=excluded.state, updated_at=CURRENT_TIMESTAMP",
+                (k, state_str),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    async def get_state(self, key: StorageKey) -> Optional[str]:
+        k = self._key_str(key)
+        db = await self._connect()
+        try:
+            cur = await db.execute("SELECT state FROM fsm_storage WHERE key=?", (k,))
+            row = await cur.fetchone()
+            return row[0] if row and row[0] else None
+        finally:
+            await db.close()
+
+    async def set_data(self, key: StorageKey, data: Dict[str, Any]) -> None:
+        k = self._key_str(key)
+        try: blob = pickle.dumps(data)
+        except Exception as ex:
+            logger.warning(f"[fsm] pickle fail: {ex}")
+            blob = pickle.dumps({})
+        db = await self._connect()
+        try:
+            await db.execute(
+                "INSERT INTO fsm_storage (key, data) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET data=excluded.data, updated_at=CURRENT_TIMESTAMP",
+                (k, blob),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    async def get_data(self, key: StorageKey) -> Dict[str, Any]:
+        k = self._key_str(key)
+        db = await self._connect()
+        try:
+            cur = await db.execute("SELECT data FROM fsm_storage WHERE key=?", (k,))
+            row = await cur.fetchone()
+            if not row or not row[0]:
+                return {}
+            try: return pickle.loads(row[0])
+            except Exception: return {}
+        finally:
+            await db.close()
+
+    async def close(self) -> None:
+        pass
+
+
+def make_storage():
+    """
+    1) Redis (если REDIS_URL) — переживает рестарт Render.
+    2) SQLite (fsm.db) — тоже переживает рестарт (файл на диске).
+    """
+    redis_url = os.environ.get("REDIS_URL")
+    if not redis_url:
+        # ── ВСТАВЬ СЮДА СВОЙ URL ИЗ UPSTASH ──
+        redis_url = "rediss://default:gQAAAAAAAxDKAAIgcDE0ZjQ2NmViNGE0NDM0ZDVhYWUzNTBmMTcwZjU3NThiNg@present-sunfish-200906.upstash.io:6379"
+
+    if redis_url:
+        try:
+            from aiogram.fsm.storage.redis import RedisStorage
+            logger.info("[storage] RedisStorage active")
+            return RedisStorage.from_url(redis_url)
+        except Exception as ex:
+            logger.warning(f"[storage] Redis fail: {ex}, fallback SQLiteStorage")
+    logger.info("[storage] SQLiteStorage active (fsm.db)")
+    return SQLiteStorage(FSM_DB_PATH)
+
+
+# ============================================================
+# АНТИСПАМ
+# ============================================================
+SPAM_PATTERNS = [
+    r"новый\s+бот", r"бот\s+для\s+пробив", r"пробив[а-яё]*",
+    r"что\s+найд[её]тся", r"поиск\s+человека\s+по\s+фото",
+    r"госномер\s+и\s+vin", r"⭐️?\s*новый\s+бот",
+    r"t\.me/[\w_]+bot", r"@[\w_]+bot\b",
+]
+_SPAM_RE = re.compile("|".join(SPAM_PATTERNS), re.IGNORECASE)
+
+
+def is_spam_message(message: Message) -> bool:
+    if not message.from_user: return False
+    if message.from_user.id in ADMINS: return False
+    txt = (message.text or message.caption or "").strip()
+    if not txt: return False
+    if message.reply_to_message and message.reply_to_message.from_user:
+        try:
+            if message.reply_to_message.from_user.id == message.bot.id: return False
+        except Exception: pass
+    return bool(_SPAM_RE.search(txt))
+
+
+class AntiSpamMiddleware:
+    async def __call__(self, handler, event, data):
+        if isinstance(event, Message) and is_spam_message(event):
+            try: await event.delete()
+            except Exception: pass
+            try: await event.answer("🚫 Реклама сторонних ботов запрещена.")
+            except Exception: pass
+            return
+        return await handler(event, data)
+
+
+# ============================================================
+# HTTP
 # ============================================================
 _HTTP_SESSION = None
-_HTTP_LOCK = asyncio.Lock()
+_HTTP_LOCK    = asyncio.Lock()
 
 async def get_session():
     global _HTTP_SESSION
@@ -204,11 +345,8 @@ async def get_session():
         async with _HTTP_LOCK:
             if _HTTP_SESSION is None or _HTTP_SESSION.closed:
                 conn = aiohttp.TCPConnector(
-                    ssl=_ssl_ctx,
-                    limit=HTTP_LIMIT,
-                    limit_per_host=HTTP_LIMIT_PER_HOST,
-                    ttl_dns_cache=HTTP_TTL_DNS,
-                    enable_cleanup_closed=True,
+                    ssl=_ssl_ctx, limit=HTTP_LIMIT, limit_per_host=HTTP_LIMIT_PER_HOST,
+                    ttl_dns_cache=HTTP_TTL_DNS, enable_cleanup_closed=True,
                 )
                 _HTTP_SESSION = aiohttp.ClientSession(
                     timeout=aiohttp.ClientTimeout(total=25, connect=8, sock_read=20),
@@ -217,21 +355,13 @@ async def get_session():
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                                       "Chrome/131.0.0.0 Safari/537.36",
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                                  "image/avif,image/webp,image/apng,*/*;q=0.8",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
                         "Accept-Encoding": "gzip, deflate",
-                        "Cache-Control": "no-cache",
-                        "Pragma": "no-cache",
-                        "Sec-Fetch-Dest": "document",
-                        "Sec-Fetch-Mode": "navigate",
-                        "Sec-Fetch-Site": "none",
-                        "Sec-Fetch-User": "?1",
-                        "Upgrade-Insecure-Requests": "1",
-                        "Connection": "keep-alive",
                     },
                 )
     return _HTTP_SESSION
+
 
 async def close_session():
     global _HTTP_SESSION
@@ -244,18 +374,15 @@ async def close_session():
 # ============================================================
 # DEPSEARCH
 # ============================================================
-class APIUnavailable(Exception):
-    pass
+class APIUnavailable(Exception): pass
 
 async def api_query(q, retries=2, timeout=20):
     q_str = str(q).strip()
     encoded = q_str.replace(" ", "%20")
     url = f"{API_BASE}/quest={encoded}&token={API_KEY}&lang=ru"
     logger.info(f"[DepSearch] URL: {url}")
-
     last_err = "unavailable"
     last_status = None
-
     for attempt in range(retries + 1):
         try:
             session = await get_session()
@@ -264,13 +391,9 @@ async def api_query(q, retries=2, timeout=20):
                 txt = await r.text()
                 last_status = r.status
                 logger.info(f"[DepSearch] HTTP {r.status} body={txt[:200]!r}")
-
                 if r.status == 200:
-                    try:
-                        return True, json.loads(txt)
-                    except Exception as ex:
-                        logger.warning(f"[DepSearch] bad json: {ex}")
-                        return False, "bad_json"
+                    try: return True, json.loads(txt)
+                    except Exception: return False, "bad_json"
                 if r.status == 400: return False, "bad_request"
                 if r.status == 401: return False, "auth_error"
                 if r.status == 403: return False, "forbidden"
@@ -278,22 +401,12 @@ async def api_query(q, retries=2, timeout=20):
                 if r.status == 429: return False, "rate_limit"
                 if r.status >= 500: return False, "server_error"
                 last_err = f"http_{r.status}"
-        except asyncio.TimeoutError:
-            last_err = "timeout"
-            logger.warning(f"[DepSearch] timeout (attempt {attempt+1})")
-        except aiohttp.ClientConnectorError as ex:
-            last_err = "conn_error"
-            logger.warning(f"[DepSearch] conn err: {ex}")
-        except aiohttp.ClientError as ex:
-            last_err = "client_error"
-            logger.warning(f"[DepSearch] client err: {ex}")
-        except Exception as ex:
-            last_err = "unknown"
-            logger.warning(f"[DepSearch] err: {ex}")
-
+        except asyncio.TimeoutError: last_err = "timeout"
+        except aiohttp.ClientConnectorError: last_err = "conn_error"
+        except aiohttp.ClientError: last_err = "client_error"
+        except Exception: last_err = "unknown"
         if attempt < retries:
             await asyncio.sleep(0.6 * (attempt + 1))
-
     if last_status is not None:
         raise APIUnavailable(last_err if last_err != "unavailable" else f"http_{last_status}")
     raise APIUnavailable(last_err)
@@ -304,22 +417,33 @@ async def fetch_json(url, timeout=10):
         session = await get_session()
         async with session.get(url, timeout=aiohttp.ClientTimeout(
                 total=timeout, connect=5, sock_read=timeout)) as r:
-            if r.status != 200:
-                logger.info(f"[fetch] {url[:80]} -> {r.status}")
-                return None
+            if r.status != 200: return None
             txt = await r.text()
             try: return json.loads(txt)
             except Exception: return None
-    except asyncio.TimeoutError:
-        logger.info(f"[fetch] timeout {url[:80]}")
-    except Exception as ex:
-        logger.info(f"[fetch] {url[:80]}: {ex}")
-    return None
+    except Exception: return None
 
 
 # ============================================================
 # ПАРСЕРЫ
 # ============================================================
+def flatten_dict(d, prefix=""):
+    rows = []
+    if isinstance(d, dict):
+        for k, v in d.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, (dict, list)): rows.extend(flatten_dict(v, key))
+            else: rows.append((key, v))
+    elif isinstance(d, list):
+        for i, item in enumerate(d):
+            key = f"{prefix}[{i}]" if prefix else f"[{i}]"
+            if isinstance(item, (dict, list)): rows.extend(flatten_dict(item, key))
+            else: rows.append((key, item))
+    else:
+        rows.append((prefix, d))
+    return rows
+
+
 def extract_phones_from(obj):
     found = set()
     def walk(o):
@@ -362,97 +486,47 @@ def extract_emails_from(obj):
 
 async def search_by_username(username):
     username = username.lstrip("@").strip()
-    if not username or len(username) < 2:
-        return None
-
+    if not username or len(username) < 2: return None
     phones, emails, extra = set(), set(), []
-
     async def safe(coro, timeout=10):
-        try:
-            return await asyncio.wait_for(coro, timeout=timeout)
-        except Exception as ex:
-            logger.info(f"src skip: {ex}")
-            return None
-
+        try: return await asyncio.wait_for(coro, timeout=timeout)
+        except Exception: return None
     dep_queries = [f"nick:{username}", f"@{username}", username]
     async def dep_call(q):
-        try:
-            return q, await api_query(q, retries=1, timeout=20)
-        except APIUnavailable as ex:
-            logger.warning(f"DepSearch unavailable for {q}: {ex}")
-            return q, None
-        except Exception as ex:
-            logger.warning(f"DepSearch err for {q}: {ex}")
-            return q, None
-
+        try: return q, await api_query(q, retries=1, timeout=20)
+        except Exception: return q, None
     dep_tasks = [dep_call(q) for q in dep_queries]
     hr_coro = safe(fetch_json(RES["u_hr_nick"].format(username=username)), 10)
     pv_coro = safe(fetch_json(RES["u_proxynova"].format(query=username)), 10)
     vk_resolve_coro = safe(fetch_json(RES["u_vk_resolve"].format(screen_name=username)), 10)
-
     dep_results_raw = await asyncio.gather(*dep_tasks)
     hr, pv, vk_resolve = await asyncio.gather(hr_coro, pv_coro, vk_resolve_coro)
-
     dep_answered = False
     for q, res in dep_results_raw:
         if res is not None:
             dep_answered = True
             ok, ds = res
             if ok and ds:
-                if ds.get("results"):
-                    extra.append((f"DepSearch ({q})", ds))
+                if ds.get("results"): extra.append((f"DepSearch ({q})", ds))
                 phones.update(extract_phones_from(ds))
                 emails.update(extract_emails_from(ds))
-
-    if not dep_answered:
-        raise APIUnavailable("timeout")
-
+    if not dep_answered: raise APIUnavailable("timeout")
     if hr and (hr.get("stealers") or hr.get("data") or hr.get("employees")):
-        phones.update(extract_phones_from(hr))
-        emails.update(extract_emails_from(hr))
+        phones.update(extract_phones_from(hr)); emails.update(extract_emails_from(hr))
         extra.append(("HudsonRock", hr))
-
     if pv:
-        phones.update(extract_phones_from(pv))
-        emails.update(extract_emails_from(pv))
-        if isinstance(pv, dict) and pv.get("lines"):
-            extra.append(("Proxynova", pv))
-
+        phones.update(extract_phones_from(pv)); emails.update(extract_emails_from(pv))
+        if isinstance(pv, dict) and pv.get("lines"): extra.append(("Proxynova", pv))
     if vk_resolve and isinstance(vk_resolve, dict) and vk_resolve.get("response") \
             and vk_resolve["response"].get("object_id"):
         vk_id = vk_resolve["response"]["object_id"]
         vk_res = await safe(fetch_json(RES["u_vk"].format(user_id=vk_id)), 10)
         if vk_res and vk_res.get("response"):
             extra.append(("VK", vk_res))
-            phones.update(extract_phones_from(vk_res))
-            emails.update(extract_emails_from(vk_res))
-
-    if not phones and not emails and not extra:
-        return None
-
-    return {
-        "username": username,
-        "phones": sorted(phones),
-        "emails": sorted(emails),
-        "extra": extra,
-    }
-
-
-def flatten_dict(d, prefix=""):
-    rows = []
-    if isinstance(d, dict):
-        for k, v in d.items():
-            key = f"{prefix}.{k}" if prefix else str(k)
-            if isinstance(v, (dict, list)): rows.extend(flatten_dict(v, key))
-            else: rows.append((key, v))
-    elif isinstance(d, list):
-        for i, item in enumerate(d):
-            key = f"{prefix}[{i}]" if prefix else f"[{i}]"
-            if isinstance(item, (dict, list)): rows.extend(flatten_dict(item, key))
-            else: rows.append((key, item))
-    else:
-        rows.append((prefix, d))
-    return rows
+            phones.update(extract_phones_from(vk_res)); emails.update(extract_emails_from(vk_res))
+    if not phones and not emails and not extra: return None
+    return {"username": username, "phones": sorted(phones),
+            "emails": sorted(emails), "extra": extra}
 
 
 def detect_query_type(q):
@@ -492,12 +566,8 @@ def detect_query_type(q):
 
 def normalize_phone(q):
     d = re.sub(r"\D", "", q.strip())
-    if len(d) == 11 and d.startswith("8"):
-        d = "7" + d[1:]
-    elif len(d) == 11 and d.startswith("7"):
-        pass
-    elif len(d) == 10:
-        d = "7" + d
+    if len(d) == 11 and d.startswith("8"):  d = "7" + d[1:]
+    elif len(d) == 10: d = "7" + d
     return d
 
 
@@ -539,15 +609,13 @@ async def self_lookup_save(normalized_phone: str, owner_user_id: int,
             "owner_first_name, owner_last_name, source) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (h, normalized_phone[-4:].rjust(len(normalized_phone), "*"),
-             owner_user_id, owner_username or "",
-             owner_fn or "", owner_ln or "", source))
+             owner_user_id, owner_username or "", owner_fn or "", owner_ln or "", source))
         await db.commit()
         cur = await db.execute("SELECT changes()")
         row = await cur.fetchone()
         return bool(row and row[0])
     except Exception as ex:
-        logger.warning(f"self_lookup_save: {ex}")
-        return False
+        logger.warning(f"self_lookup_save: {ex}"); return False
     finally:
         await db.close()
 
@@ -559,9 +627,7 @@ def _tokens_from_user(user) -> set:
         x = str(x).strip().lower()
         if len(x) < 3: return
         toks.add(x)
-    add(user.username)
-    add(user.first_name)
-    add(user.last_name)
+    add(user.username); add(user.first_name); add(user.last_name)
     if user.first_name and user.last_name:
         add(f"{user.first_name} {user.last_name}")
         add(f"{user.last_name} {user.first_name}")
@@ -572,66 +638,334 @@ def _flatten_strings(obj, out=None, depth=0):
     if out is None: out = []
     if depth > 12: return out
     if isinstance(obj, dict):
-        for v in obj.values():
-            _flatten_strings(v, out, depth + 1)
+        for v in obj.values(): _flatten_strings(v, out, depth + 1)
     elif isinstance(obj, list):
-        for it in obj:
-            _flatten_strings(it, out, depth + 1)
-    elif isinstance(obj, str):
-        out.append(obj)
+        for it in obj: _flatten_strings(it, out, depth + 1)
+    elif isinstance(obj, str): out.append(obj)
     return out
 
 
 def _match_owner_in_result(user, data) -> bool:
-    if not data:
-        return False
+    if not data: return False
     user_tokens = _tokens_from_user(user)
-    if not user_tokens:
-        return False
+    if not user_tokens: return False
     strings = _flatten_strings(data)
-    if not strings:
-        return False
     for s in strings:
         sl = str(s).strip().lower()
         if not sl: continue
-        if sl in user_tokens:
-            return True
-        if sl.startswith("@") and sl[1:] in user_tokens:
-            return True
+        if sl in user_tokens: return True
+        if sl.startswith("@") and sl[1:] in user_tokens: return True
         for t in user_tokens:
-            if len(t) >= 4 and t in sl:
-                return True
+            if len(t) >= 4 and t in sl: return True
     return False
 
 
 # ============================================================
-# ФОРМАТИРОВАНИЕ
+# ЦЕПОЧКА — парсер + рендер
+# ============================================================
+CHAIN_ROOT_KEYS   = ("phone", "телефон", "number", "номер")
+CHAIN_ADDR_KEYS   = ("address", "адрес", "регион", "region", "city",
+                     "город", "country", "страна", "локац")
+CHAIN_PARENT_KEYS = ("mother", "father", "parent", "родител", "мать",
+                     "отец", "мама", "папа", "mom", "dad")
+
+
+def _chain_pick(flat, keys, exclude=None):
+    for k, v in flat:
+        kl = k.lower()
+        if exclude and any(x in kl for x in exclude): continue
+        if any(x in kl for x in keys) and v not in (None, ""):
+            return str(v).strip()
+    return ""
+
+
+def _chain_collect(flat, limit, exclude_keys=()):
+    out, seen = [], set()
+    for k, v in flat:
+        kl = k.lower()
+        if not v: continue
+        vs = str(v).strip()
+        if not vs or len(vs) > 120: continue
+        if any(x in kl for x in exclude_keys): continue
+        key_norm = re.sub(r"[_\s]+", " ", kl).strip()
+        if key_norm in seen: continue
+        seen.add(key_norm)
+        out.append({"k": k, "v": vs})
+        if len(out) >= limit: break
+    return out
+
+
+def build_chain_data(data: dict, query: str, qtype_name: str = "") -> dict:
+    flat_all = []
+    if isinstance(data, dict):
+        for block in ("phone_info", "ip_info"):
+            if isinstance(data.get(block), dict):
+                for k, v in data[block].items(): flat_all.append((k, v))
+        for item in (data.get("results") or []):
+            if isinstance(item, dict): flat_all.extend(flatten_dict(item))
+            else: flat_all.append(("value", str(item)))
+    root = query or _chain_pick(flat_all, CHAIN_ROOT_KEYS)
+    address = _chain_pick(flat_all, CHAIN_ADDR_KEYS)
+    parents = _chain_pick(flat_all, CHAIN_PARENT_KEYS)
+    mid = _chain_collect(flat_all, 7, exclude_keys=CHAIN_ADDR_KEYS + CHAIN_PARENT_KEYS)
+    right_raw = _chain_collect(flat_all, 16, exclude_keys=CHAIN_ROOT_KEYS)
+    right = right_raw[::-1][:8]
+    return {"root": root or "—", "mid": mid, "address": address or "—",
+            "parents": parents or "—", "right": right, "qtype": qtype_name,
+            "created": datetime.now().strftime("%d.%m.%Y %H:%M")}
+
+
+# ==== Шаблон chain.html (полностью вшит) ====
+_CHAIN_HTML_TPL = r'''<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#16181c">
+<title>CrustyChain</title>
+<style>
+:root{
+  --bg:#f6f7f9; --dot:#d9dce2; --box:#fff; --line:#c3c7ce; --border:#d3d6dc;
+  --text:#2b2f36; --hint:#9aa0aa; --focus:#4a6cf7;
+}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#16181c; --dot:#262a31; --box:#20242a; --line:#4a505b; --border:#383d46; --text:#e6e8ec; --hint:#6b7280; --focus:#7f97ff;}
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font:13px/1.3 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;display:flex;flex-direction:column}
+header{padding:calc(12px + env(safe-area-inset-top,0px)) calc(16px + env(safe-area-inset-right,0px)) 12px calc(16px + env(safe-area-inset-left,0px));display:flex;gap:12px;align-items:center;justify-content:space-between}
+.tools{display:flex;gap:8px}
+h1{font-size:16px;font-weight:600;margin:0}
+button{min-width:40px;min-height:36px;font:inherit;color:var(--text);background:var(--box);border:1px solid var(--border);border-radius:5px;padding:5px 10px;cursor:pointer}
+button:hover{border-color:var(--focus)}
+.wrap{flex:1;min-height:0;overflow:auto;-webkit-overflow-scrolling:touch;padding-bottom:env(safe-area-inset-bottom,0px);background-image:radial-gradient(var(--dot) 1px,transparent 1px);background-size:18px 18px}
+.wrap{cursor:grab}
+.wrap.pan{cursor:grabbing;user-select:none}
+#sizer{position:relative}
+#board{position:absolute;left:0;top:0;width:3000px;height:2000px;transform-origin:0 0}
+svg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
+path{fill:none;stroke:var(--line);stroke-width:1.6}
+.arrow{fill:var(--line);stroke:none}
+.node{position:absolute;height:30px;background:var(--box);border:1px solid var(--border);border-radius:5px;
+  padding:7px 8px;font-size:11px;white-space:nowrap;overflow:hidden;outline:none;cursor:grab;
+  box-shadow:0 1px 2px rgba(0,0,0,.05);touch-action:none;user-select:none;-webkit-user-select:none}
+.node:empty::before{content:attr(data-hint);color:var(--hint)}
+@media (pointer:coarse){.node[contenteditable=true]{font-size:16px}}
+.node.drag{cursor:grabbing;box-shadow:0 6px 16px rgba(0,0,0,.18);z-index:5}
+.node[contenteditable=true]{cursor:text;user-select:text;-webkit-user-select:text;border-color:var(--focus);box-shadow:0 0 0 2px color-mix(in srgb,var(--focus) 25%,transparent)}
+</style>
+</head>
+<body>
+<header>
+  <h1>CrustyChain</h1>
+  <div class="tools">
+    <button id="zout" aria-label="Уменьшить">−</button>
+    <button id="zin" aria-label="Увеличить">+</button>
+    <button id="reset">Сбросить</button>
+  </div>
+</header>
+<div class="wrap">
+  <div id="sizer"><div id="board">
+    <svg id="lines"><defs>
+      <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+        <path class="arrow" d="M0 1 L10 5 L0 9 z"/>
+      </marker></defs></svg>
+  </div></div>
+</div>
+<script>
+const board = document.getElementById('board');
+const svg = document.getElementById('lines');
+const W = 130, H = 30, CY = 1000, OX = 940, BW = 3000, BH = 2000;
+const nodes = [], edges = [];
+const wrap = document.querySelector('.wrap'), sizer = document.getElementById('sizer');
+let scale = 1;
+function setScale(v){
+  scale = Math.min(1.6, Math.max(0.3, v));
+  board.style.transform = `scale(${scale})`;
+  sizer.style.width = BW * scale + 'px';
+  sizer.style.height = BH * scale + 'px';
+}
+setScale(wrap.clientWidth < 800 ? Math.max(0.5, wrap.clientWidth / 1400 * 1.6) : 1);
+function center(){
+  wrap.scrollLeft = BW / 2 * scale - wrap.clientWidth / 2;
+  wrap.scrollTop = CY * scale - wrap.clientHeight / 2;
+}
+requestAnimationFrame(center);
+document.getElementById('zin').onclick = () => setScale(scale * 1.2);
+document.getElementById('zout').onclick = () => setScale(scale / 1.2);
+function node(x, cy, w, hint){
+  const el = document.createElement('div');
+  el.className = 'node';
+  el.dataset.hint = hint || '';
+  el.style.width = w + 'px';
+  const n = {el, w, x0: x + OX, y0: cy - H/2};
+  place(n, n.x0, n.y0);
+  board.appendChild(el);
+  nodes.push(n);
+  bindDrag(n);
+  return n;
+}
+function place(n, x, y){
+  n.x = x; n.y = y;
+  n.el.style.left = x + 'px';
+  n.el.style.top = y + 'px';
+}
+function column(x, count, gap, hint){
+  const top = CY - (count - 1) * gap / 2;
+  return Array.from({length: count}, (_, i) => node(x, top + i * gap, W, hint));
+}
+function link(a, b, type){
+  const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  p.setAttribute('marker-end', 'url(#ah)');
+  svg.appendChild(p);
+  edges.push({a, b, type, p});
+}
+function draw(){
+  for (const {a, b, type, p} of edges){
+    let d;
+    if (type === 'v'){
+      const x1 = a.x + a.w/2, y1 = a.y + H, x2 = b.x + b.w/2, y2 = b.y - 2;
+      const dy = Math.max(Math.abs(y2 - y1) * 0.5, 10);
+      d = `M${x1} ${y1} C${x1} ${y1+dy} ${x2} ${y2-dy} ${x2} ${y2}`;
+    } else {
+      const x1 = a.x + a.w, y1 = a.y + H/2, x2 = b.x - 2, y2 = b.y + H/2;
+      const dx = Math.max(Math.abs(x2 - x1) * 0.5, 30);
+      d = `M${x1} ${y1} C${x1+dx} ${y1} ${x2-dx} ${y2} ${x2} ${y2}`;
+    }
+    p.setAttribute('d', d);
+  }
+}
+function bindDrag(n){
+  const el = n.el;
+  let sx, sy, ox, oy, moved, id;
+  el.addEventListener('pointerdown', e => {
+    if (el.isContentEditable) return;
+    id = e.pointerId; el.setPointerCapture(id);
+    sx = e.clientX; sy = e.clientY; ox = n.x; oy = n.y; moved = false;
+  });
+  el.addEventListener('pointermove', e => {
+    if (id == null || el.isContentEditable) return;
+    const dx = (e.clientX - sx) / scale, dy = (e.clientY - sy) / scale;
+    if (!moved && Math.hypot(dx, dy) < 4) return;
+    moved = true; el.classList.add('drag');
+    place(n, Math.min(BW - n.w, Math.max(0, ox + dx)), Math.min(BH - H, Math.max(0, oy + dy)));
+    draw();
+  });
+  const end = () => {
+    if (id == null) return;
+    id = null; el.classList.remove('drag');
+    if (!moved){
+      el.contentEditable = 'true';
+      el.focus();
+      const r = document.createRange(); r.selectNodeContents(el); r.collapse(false);
+      const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+    }
+  };
+  el.addEventListener('pointerup', end);
+  el.addEventListener('pointercancel', end);
+  el.addEventListener('blur', () => { el.contentEditable = 'false'; });
+  el.addEventListener('keydown', e => { if (e.key === 'Enter'){ e.preventDefault(); el.blur(); } });
+}
+(() => {
+  let p = null;
+  wrap.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'touch' || e.button !== 0 || e.target.closest('.node, button')) return;
+    p = {x: e.clientX, y: e.clientY, l: wrap.scrollLeft, t: wrap.scrollTop};
+    wrap.setPointerCapture(e.pointerId);
+    wrap.classList.add('pan');
+  });
+  wrap.addEventListener('pointermove', e => {
+    if (!p) return;
+    wrap.scrollLeft = p.l - (e.clientX - p.x);
+    wrap.scrollTop = p.t - (e.clientY - p.y);
+  });
+  const stop = () => { p = null; wrap.classList.remove('pan'); };
+  wrap.addEventListener('pointerup', stop);
+  wrap.addEventListener('pointercancel', stop);
+})();
+
+// === ДАННЫЕ ИЗ БОТА ===
+const DATA = __DATA_JSON__;
+function safeText(s){ return String(s == null ? '—' : s).slice(0, 40); }
+function kvText(d){ return d ? safeText(d.k + ': ' + d.v) : '—'; }
+
+const start = node(10, CY, 110, 'номер');
+start.el.textContent = safeText(DATA.root);
+
+const midCount = Math.max(DATA.mid.length, 7);
+const mid = column(320, midCount, 62, 'данные');
+mid.forEach((m, i) => { m.el.textContent = kvText(DATA.mid[i]); });
+
+const hub = node(520, CY, 110, 'адрес');
+hub.el.textContent = safeText(DATA.address);
+
+const next = node(660, CY, 110, 'родители');
+next.el.textContent = safeText(DATA.parents);
+
+const rightCount = Math.max(DATA.right.length, 8);
+const right = column(930, rightCount, 56, 'данные');
+right.forEach((r, i) => { r.el.textContent = kvText(DATA.right[i]); });
+
+mid.forEach(m => link(start, m));
+mid.forEach((m, i) => { if (i < mid.length - 1) link(m, mid[i + 1], 'v'); });
+mid.forEach(m => link(m, hub));
+link(hub, next);
+right.forEach(r => link(next, r));
+draw();
+document.getElementById('reset').onclick = () => {
+  nodes.forEach(n => place(n, n.x0, n.y0));
+  draw();
+  center();
+};
+</script>
+</body>
+</html>'''
+
+
+def render_chain_html(chain: dict) -> str:
+    tpl = _CHAIN_HTML_TPL
+    if os.path.exists(CHAIN_HTML_PATH):
+        try:
+            with open(CHAIN_HTML_PATH, "r", encoding="utf-8") as f:
+                tpl = f.read()
+        except Exception as ex:
+            logger.warning(f"[chain] не смог прочитать chain.html: {ex}")
+    data_json = json.dumps(chain, ensure_ascii=False)
+    js_data = f"const DATA = {data_json};"
+    # подставляем данные
+    tpl = tpl.replace("__DATA_JSON__", data_json)
+    tpl = tpl.replace("{{DATA_JSON}}", data_json)
+    # если шаблон не содержит DATA — допишем
+    if "const DATA =" not in tpl:
+        tpl = tpl.replace("</script>\n</body>", f"{js_data}\n</script>\n</body>")
+    return tpl
+
+
+# ============================================================
+# ФОРМАТИРОВАНИЕ РЕЗУЛЬТАТА
 # ============================================================
 def format_results(query, data, qtype_name="", self_binding=None):
     lines = ["╔══════════════════════════╗",
              "║   🔎  РЕЗУЛЬТАТ ПОИСКА    ║",
              "╚══════════════════════════╝", ""]
-
     if self_binding:
         owner_id, owner_un, owner_fn, owner_ln, src, created = self_binding
         lines.extend([
             "╔══════════════════════════╗",
             "║   🎯  СВЯЗЬ С АККАУНТОМ   ║",
             "╚══════════════════════════╝", "",
-            f"📞 Номер привязан к TG-аккаунту:",
+            "📞 Номер привязан к TG-аккаунту:",
             f"   • user_id: <code>{owner_id}</code>",
             f"   • username: @{h_esc(owner_un or '—')}",
             f"   • имя: {h_esc((owner_fn + ' ' + owner_ln).strip() or '—')}",
             f"   • засветил: {h_esc(created)}",
             "", "━━━━━━━━━━━━━━━━━━━━━━━━", "",
         ])
-
     if qtype_name: lines.append(f"🏷 <b>Тип:</b> {h_esc(qtype_name)}")
     lines.append(f"📌 <b>Запрос:</b> <code>{h_esc(query)}</code>")
     lines.append(f"🕐 <b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-    lines.append("")
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
-
+    lines.append(""); lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
     if "phone_info" in data:
         pi = data["phone_info"]
         lines.extend(["", "📱 <b>ИНФОРМАЦИЯ О НОМЕРЕ</b>", "",
@@ -646,7 +980,6 @@ def format_results(query, data, qtype_name="", self_binding=None):
                       f"   🌍 Страна: {h_esc(ii.get('country', '—'))}",
                       f"   🏙 Город: {h_esc(ii.get('city', '—'))}",
                       f"   📡 Провайдер: {h_esc(ii.get('provider', '—'))}"])
-
     results = data.get("results", [])
     lines.extend(["", "━━━━━━━━━━━━━━━━━━━━━━━━", ""])
     if results:
@@ -658,15 +991,12 @@ def format_results(query, data, qtype_name="", self_binding=None):
                     if isinstance(v, (dict, list)):
                         for kk, vv in flatten_dict(v, k)[:20]:
                             lines.append(f"│ <b>{h_esc(kk)}:</b> {h_esc(vv)}")
-                    else:
-                        lines.append(f"│ <b>{h_esc(k)}:</b> {h_esc(v)}")
-            else:
-                lines.append(f"│ {h_esc(item)}")
+                    else: lines.append(f"│ <b>{h_esc(k)}:</b> {h_esc(v)}")
+            else: lines.append(f"│ {h_esc(item)}")
             lines.extend(["└─────────────────────", ""])
         if len(results) > 10:
             lines.append(f"… И ещё {len(results) - 10}. HTML полный.")
-    else:
-        lines.append("❌ Ничего не найдено.")
+    else: lines.append("❌ Ничего не найдено.")
     lines.extend(["", "━━━━━━━━━━━━━━━━━━━━━━━━"])
     return "\n".join(lines)
 
@@ -677,18 +1007,14 @@ def format_username_result(username, result):
              "╚══════════════════════════╝", ""]
     lines.append(f"👤 <b>Ник:</b> <code>@{h_esc(username)}</code>")
     lines.append(f"🕐 <b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-    lines.append("")
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(""); lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
     if result["phones"]:
         lines.extend(["", "📱 <b>НОМЕРА ТЕЛЕФОНОВ:</b>", ""])
-        for p in result["phones"]:
-            lines.append(f"   ☎️ <code>{h_esc(p)}</code>")
-    else:
-        lines.extend(["", "📱 <b>Номера не найдены</b>"])
+        for p in result["phones"]: lines.append(f"   ☎️ <code>{h_esc(p)}</code>")
+    else: lines.extend(["", "📱 <b>Номера не найдены</b>"])
     if result["emails"]:
         lines.extend(["", "📧 <b>EMAIL:</b>", ""])
-        for e in result["emails"]:
-            lines.append(f"   ✉️ <code>{h_esc(e)}</code>")
+        for e in result["emails"]: lines.append(f"   ✉️ <code>{h_esc(e)}</code>")
     for src_name, raw in result.get("extra", []):
         results = raw.get("results") if isinstance(raw, dict) else None
         if results:
@@ -701,23 +1027,22 @@ def format_username_result(username, result):
                         if isinstance(v, (dict, list)):
                             for kk, vv in flatten_dict(v, k)[:10]:
                                 lines.append(f"│ <b>{h_esc(kk)}:</b> {h_esc(vv)}")
-                        else:
-                            lines.append(f"│ <b>{h_esc(k)}:</b> {h_esc(v)}")
+                        else: lines.append(f"│ <b>{h_esc(k)}:</b> {h_esc(v)}")
                 lines.append("└─────────────────────"); lines.append("")
     lines.extend(["", "━━━━━━━━━━━━━━━━━━━━━━━━"])
     return "\n".join(lines)
 
 
+# ============================================================
+# HTML-отчёт
+# ============================================================
 def build_html_report(query, data, qtype_name="", username_result=None, self_binding=None):
     def esc(s):
         return (str(s).replace("&", "&amp;").replace("<", "&lt;")
                 .replace(">", "&gt;").replace('"', "&quot;"))
-
     def md5h(x):
-        try:
-            return hashlib.md5(str(x).encode("utf-8", "ignore")).hexdigest()[:12]
-        except Exception:
-            return "000000000000"
+        try: return hashlib.md5(str(x).encode("utf-8", "ignore")).hexdigest()[:12]
+        except Exception: return "000000000000"
 
     records = []
     phones_all, emails_all, fio_all, regions_all, birth_all = set(), set(), set(), set(), set()
@@ -744,14 +1069,12 @@ def build_html_report(query, data, qtype_name="", username_result=None, self_bin
     if data:
         if isinstance(data.get("phone_info"), dict):
             pi = data["phone_info"]
-            flat = [[k, v] for k, v in pi.items()]
-            records.append(flat)
+            flat = [[k, v] for k, v in pi.items()]; records.append(flat)
             if pi.get("phone"): phones_all.add(str(pi["phone"]))
             if pi.get("region"): regions_all.add(str(pi["region"]))
         if isinstance(data.get("ip_info"), dict):
             ii = data["ip_info"]
-            flat = [[k, v] for k, v in ii.items()]
-            records.append(flat)
+            flat = [[k, v] for k, v in ii.items()]; records.append(flat)
             if ii.get("country"): regions_all.add(str(ii["country"]))
         for item in data.get("results", []):
             flat = flatten_dict(item) if isinstance(item, dict) else [("value", str(item))]
@@ -784,13 +1107,9 @@ def build_html_report(query, data, qtype_name="", username_result=None, self_bin
     summary_cards = [("Записей", f"{total_records:02d}", "найдено"),
                      ("Источников", f"{sources_count:02d}", "баз данных"),
                      ("Тип", esc(qtype_name or "—"), "запроса")]
-    if phones_all:
-        summary_cards.append(("Телефон", f'<span class="mono">{esc(sorted(phones_all)[0])}</span>', "идентификатор"))
-    if emails_all:
-        summary_cards.append(("Email", f'<span class="mono">{esc(sorted(emails_all)[0])}</span>', "адрес"))
-    if fio_all:
-        summary_cards.append(("ФИО", esc(sorted(fio_all)[0]), f"{len(fio_all)} вариант(ов)"))
-
+    if phones_all:  summary_cards.append(("Телефон", f'<span class="mono">{esc(sorted(phones_all)[0])}</span>', "идентификатор"))
+    if emails_all:  summary_cards.append(("Email", f'<span class="mono">{esc(sorted(emails_all)[0])}</span>', "адрес"))
+    if fio_all:     summary_cards.append(("ФИО", esc(sorted(fio_all)[0]), f"{len(fio_all)} вариант(ов)"))
     summary_html = "".join(
         f'<div class="metric"><div class="k">{esc(k)}</div><div class="v">{v}</div>'
         f'<div class="hint">{esc(h)}</div></div>'
@@ -826,11 +1145,11 @@ def build_html_report(query, data, qtype_name="", username_result=None, self_bin
                          '<div class="meta">нет данных</div></div></div>')
 
     kv_rows = ""
-    if phones_all: kv_rows += f'<div class="key">Телефон</div><div class="mono">{esc(sorted(phones_all)[0])}</div>'
-    if emails_all: kv_rows += f'<div class="key">Email</div><div class="mono">{esc(sorted(emails_all)[0])}</div>'
-    if fio_all:    kv_rows += f'<div class="key">ФИО</div><div>{esc(sorted(fio_all)[0])}</div>'
-    if birth_all:  kv_rows += f'<div class="key">Дата рождения</div><div class="mono">{esc(sorted(birth_all)[0])}</div>'
-    if regions_all:kv_rows += f'<div class="key">Регион</div><div>{esc(", ".join(sorted(regions_all)[:3]))}</div>'
+    if phones_all:  kv_rows += f'<div class="key">Телефон</div><div class="mono">{esc(sorted(phones_all)[0])}</div>'
+    if emails_all:  kv_rows += f'<div class="key">Email</div><div class="mono">{esc(sorted(emails_all)[0])}</div>'
+    if fio_all:     kv_rows += f'<div class="key">ФИО</div><div>{esc(sorted(fio_all)[0])}</div>'
+    if birth_all:   kv_rows += f'<div class="key">Дата рождения</div><div class="mono">{esc(sorted(birth_all)[0])}</div>'
+    if regions_all: kv_rows += f'<div class="key">Регион</div><div>{esc(", ".join(sorted(regions_all)[:3]))}</div>'
     kv_rows += f'<div class="key">Запрос</div><div class="mono">{esc(query)}</div>'
 
     profiles_rows = ""
@@ -848,7 +1167,7 @@ def build_html_report(query, data, qtype_name="", username_result=None, self_bin
         profiles_rows = '<tr><td colspan="3" style="text-align:center;color:#777">нет профилей</td></tr>'
 
     aliases_html = ""
-    for a in sorted(fio_all)[:20]:  aliases_html += f'<span class="tag">{esc(a)}</span>'
+    for a in sorted(fio_all)[:20]:   aliases_html += f'<span class="tag">{esc(a)}</span>'
     for e in sorted(emails_all)[:20]: aliases_html += f'<span class="tag">{esc(e)}</span>'
     for p in sorted(phones_all)[:20]: aliases_html += f'<span class="tag">{esc(p)}</span>'
     if not aliases_html: aliases_html = '<span class="tag">—</span>'
@@ -895,223 +1214,100 @@ def build_html_report(query, data, qtype_name="", username_result=None, self_bin
     emails_tags = "".join(f'<span class="tag">{esc(e)}</span>' for e in sorted(emails_all)) \
                   or '<span class="tag">email не найдены</span>'
 
+    # CSS — компактная версия (полный блок как в исходнике оставлен для совместимости)
+    CSS = """
+    body{margin:0;background:#050506;color:#f4f4f1;font:14px system-ui,sans-serif}
+    .wrap{max-width:1240px;margin:auto;padding:20px}
+    .top{height:60px;display:flex;align-items:center;border-bottom:1px solid #222;gap:16px}
+    .brand{font-size:18px;font-weight:800}
+    .hero{padding:30px 0;border-bottom:1px solid #222}
+    .hero h1{font-size:34px;margin:0}
+    .sub{color:#888;margin-top:8px}
+    .notice{padding:12px;border:1px solid #222;border-radius:12px;margin:20px 0;color:#aaa;font-size:12px}
+    section{margin:30px 0}
+    .section-title{display:flex;justify-content:space-between;margin-bottom:12px}
+    .section-title h2{font-size:20px;margin:0}
+    .section-title p{color:#888;font-size:12px;margin:0}
+    .card,.panel{background:#0d0d0f;border:1px solid #222;border-radius:14px;padding:16px}
+    .summary{display:grid;grid-template-columns:repeat(3,1fr);gap:0}
+    .metric{padding:16px;border-right:1px solid #222;border-bottom:1px solid #222}
+    .metric:nth-child(3n){border-right:0}
+    .metric .k{color:#888;font-size:11px;text-transform:uppercase}
+    .metric .v{font-size:20px;font-weight:800;margin-top:6px;overflow-wrap:anywhere}
+    .metric .hint{color:#666;font-size:11px;margin-top:3px}
+    .kv{display:grid;grid-template-columns:160px 1fr}
+    .kv>div{padding:8px 0;border-bottom:1px solid #222}
+    .kv .key{color:#888}
+    .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    .tag{display:inline-block;padding:6px 10px;margin:3px;border:1px solid #333;border-radius:999px;font-size:11px}
+    .mono{font-family:ui-monospace,monospace}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:10px 12px;border-bottom:1px solid #222;text-align:left;font-size:12px}
+    th{color:#888;font-size:10px;text-transform:uppercase}
+    .source{margin-bottom:8px;background:#0d0d0f;border:1px solid #222;border-radius:12px}
+    .source summary{padding:12px 16px;cursor:pointer;display:flex;justify-content:space-between}
+    .source-body{padding:12px 16px;border-top:1px solid #222}
+    .identity{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #222}
+    .identity:last-child{border-bottom:0}
+    .name{font-weight:700}
+    .meta{color:#888;font-size:11px}
+    .score{font-family:ui-monospace,monospace;font-size:12px}
+    .bar{width:80px;height:4px;background:#1a1a1a;margin-top:6px;border-radius:2px}
+    .bar i{display:block;height:100%;background:#fff;border-radius:2px}
+    .address{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #222}
+    .address:last-child{border-bottom:0}
+    .mapbtn{padding:6px 10px;border:1px solid #333;border-radius:999px;background:transparent;color:inherit;font-size:11px}
+    footer{padding:20px 0;color:#666;font-size:11px;text-align:center;border-top:1px solid #222;margin-top:30px}
+    """
+
     return f"""<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
+<html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>CrustySearch — {esc(query)}</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@500;600;700;800&family=JetBrains+Mono:wght@500;600&display=swap');
-:root{{
-  --bg:#050506; --panel:rgba(255,255,255,.028); --panel-2:rgba(255,255,255,.045);
-  --line:rgba(255,255,255,.09); --line-2:rgba(255,255,255,.16);
-  --text:#f4f4f1; --muted:#85868b; --muted-2:#63656c;
-  --r-xl:26px; --r-lg:20px; --r-md:16px; --r-pill:999px;
-  --ease:cubic-bezier(.22,.8,.22,1);
-}}
-*{{box-sizing:border-box}}
-html{{scroll-behavior:smooth;background:var(--bg)}}
-body{{margin:0;color:var(--text);background:var(--bg);font-family:Inter,system-ui,sans-serif;font-weight:500;min-height:100vh;-webkit-font-smoothing:antialiased}}
-button,input{{font:inherit}}button{{color:inherit;cursor:pointer;border:0;background:none}}
-.mono{{font-family:"JetBrains Mono",monospace;font-size:.9em;letter-spacing:-.02em}}
-.wrap{{max-width:1240px;margin:auto;padding:0 30px}}
-.top{{height:68px;background:rgba(5,5,6,.85);backdrop-filter:blur(20px) saturate(140%);-webkit-backdrop-filter:blur(20px) saturate(140%);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:30}}
-.topbar{{height:100%;display:flex;align-items:center;gap:22px}}
-.brand{{font-size:19px;font-weight:800;letter-spacing:-.05em;white-space:nowrap}}
-.brand span{{font-weight:500;color:#999}}
-.search{{height:42px;flex:1;max-width:440px;margin-left:auto;border:1px solid var(--line);background:rgba(255,255,255,.04);padding:0 16px;outline:none;font-weight:600;color:var(--text);border-radius:var(--r-pill);transition:background .25s var(--ease),border-color .25s var(--ease),box-shadow .25s var(--ease)}}
-.search:focus{{background:rgba(255,255,255,.06);border-color:var(--line-2);box-shadow:0 0 0 4px rgba(255,255,255,.05)}}
-.search::placeholder{{color:var(--muted-2)}}
-.actions{{display:flex;gap:8px}}
-.btn{{display:inline-flex;align-items:center;justify-content:center;min-height:42px;padding:0 16px;font-weight:700;font-size:13px;color:var(--text);background:rgba(255,255,255,.045);border:1px solid var(--line);border-radius:var(--r-pill);text-decoration:none;transition:transform .22s var(--ease),background .22s var(--ease),border-color .22s var(--ease),box-shadow .22s var(--ease)}}
-.btn:hover{{background:rgba(255,255,255,.09);border-color:var(--line-2);transform:translateY(-2px);box-shadow:0 12px 30px rgba(0,0,0,.35)}}
-.btn:active{{transform:translateY(0) scale(.97)}}
-.hero{{margin-top:18px;padding:46px 0 34px;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-xl);overflow:hidden;animation:fadeUp .7s var(--ease) both}}
-.crumb{{font-size:11px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:14px}}
-.badge{{display:inline-block;border:1px solid var(--line);padding:4px 10px;margin-left:7px;color:var(--text);background:rgba(255,255,255,.04);border-radius:var(--r-pill);letter-spacing:.06em;font-size:11px}}
-.hero h1{{font-size:46px;line-height:.98;letter-spacing:-.06em;font-weight:800;margin:0 0 12px;animation:fadeUp .8s .05s var(--ease) both}}
-.sub{{font-weight:600;color:var(--muted)}}
-.sub .mono{{color:var(--text)}}
-.nav{{margin-top:14px;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);overflow:auto}}
-.navrow{{display:flex;gap:28px;overflow:auto;white-space:nowrap;padding:0 30px}}
-.nav a{{padding:16px 0;color:var(--muted);font-size:12px;font-weight:700;position:relative;text-decoration:none;transition:color .22s var(--ease)}}
-.nav a::after{{content:"";position:absolute;left:0;right:100%;bottom:0;height:2px;background:var(--text);transition:right .3s var(--ease);border-radius:2px}}
-.nav a:hover{{color:var(--text)}}
-.nav a:hover::after{{right:0}}
-main{{padding:34px 0 80px}}
-.notice{{background:rgba(255,255,255,.035);color:var(--text);padding:14px 18px;font-size:12px;font-weight:600;margin-bottom:26px;border:1px solid var(--line);border-radius:var(--r-md);animation:fadeUp .6s var(--ease) both}}
-section{{margin-bottom:44px;scroll-margin-top:95px}}
-.section-title{{display:flex;justify-content:space-between;align-items:end;margin-bottom:14px}}
-.section-title h2{{font-size:22px;font-weight:800;letter-spacing:-.04em;margin:0}}
-.section-title p{{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin:0}}
-.card,.panel,.source{{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);transition:border-color .28s var(--ease),background .28s var(--ease),transform .28s var(--ease),box-shadow .28s var(--ease)}}
-.card:hover,.panel:hover{{border-color:var(--line-2);background:rgba(255,255,255,.035);box-shadow:0 16px 40px rgba(0,0,0,.28);transform:translateY(-2px)}}
-.summary{{display:grid;grid-template-columns:repeat(3,1fr);overflow:hidden}}
-.metric{{padding:24px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);transition:background .25s var(--ease);animation:fadeUp .6s var(--ease) both}}
-.metric:hover{{background:rgba(255,255,255,.03)}}
-.metric:nth-child(3n){{border-right:0}}
-.metric:nth-last-child(-n+3){{border-bottom:0}}
-.metric .k{{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;font-weight:800}}
-.metric .v{{font-size:24px;font-weight:800;letter-spacing:-.04em;margin-top:8px;overflow-wrap:anywhere}}
-.metric .hint{{font-size:11px;color:var(--muted-2);font-weight:600;margin-top:3px}}
-.grid2{{display:grid;grid-template-columns:1fr 1fr;gap:18px}}
-.panel{{padding:22px}}
-.panel h3{{margin:0 0 16px;font-size:14px;font-weight:800}}
-.identity{{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:14px 10px;border-top:1px solid var(--line);border-radius:12px;transition:padding-left .25s var(--ease),background .25s var(--ease)}}
-.identity:hover{{padding-left:16px;background:rgba(255,255,255,.02)}}
-.identity:first-of-type{{border-top:0}}
-.name{{font-weight:800}}
-.meta{{font-size:11px;color:var(--muted);font-weight:600;margin-top:2px}}
-.score{{font-family:"JetBrains Mono",monospace;font-weight:600;font-size:12px}}
-.bar{{width:96px;height:5px;background:rgba(255,255,255,.06);margin-top:8px;overflow:hidden;border-radius:var(--r-pill)}}
-.bar i{{display:block;height:100%;background:#fff;transform-origin:left;border-radius:var(--r-pill);animation:bar 1s var(--ease) both}}
-.kv{{display:grid;grid-template-columns:175px 1fr}}
-.kv div{{padding:10px 0;border-bottom:1px solid var(--line)}}
-.kv .key{{color:var(--muted);font-weight:600}}
-.kv .mono{{color:var(--text)}}
-table{{width:100%;border-collapse:separate;border-spacing:0;overflow:hidden;border-radius:var(--r-lg)}}
-th,td{{text-align:left;padding:12px 16px;border-bottom:1px solid var(--line)}}
-th{{font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:800;letter-spacing:.08em;background:rgba(255,255,255,.02)}}
-td{{font-weight:600;font-size:12px}}
-tbody tr{{transition:background .2s var(--ease)}}
-tbody tr:hover{{background:rgba(255,255,255,.03)}}
-tbody tr:last-child td{{border-bottom:0}}
-.tag{{display:inline-block;background:rgba(255,255,255,.045);padding:7px 12px;margin:4px;font-size:11px;font-weight:700;border:1px solid var(--line);border-radius:var(--r-pill);color:var(--text);transition:transform .22s var(--ease),background .22s var(--ease),border-color .22s var(--ease)}}
-.tag:hover{{background:rgba(255,255,255,.11);border-color:var(--line-2);transform:translateY(-2px)}}
-.address{{display:flex;justify-content:space-between;align-items:center;padding:14px 10px;border-top:1px solid var(--line);border-radius:12px;transition:background .22s var(--ease)}}
-.address:first-child{{border-top:0}}
-.address:hover{{background:rgba(255,255,255,.02)}}
-.address b{{font-weight:800}}
-.mapbtn{{border:1px solid var(--line);background:rgba(255,255,255,.045);padding:8px 12px;font-weight:700;font-size:12px;border-radius:var(--r-pill);transition:transform .22s var(--ease),background .22s var(--ease),border-color .22s var(--ease)}}
-.mapbtn:hover{{background:rgba(255,255,255,.09);border-color:var(--line-2);transform:translateY(-2px)}}
-.sources{{display:grid;grid-template-columns:1fr 1fr;gap:14px}}
-.source{{overflow:hidden;background:rgba(255,255,255,.02)}}
-.source summary{{cursor:pointer;list-style:none;padding:16px 20px;display:flex;justify-content:space-between;align-items:center;font-weight:800;transition:background .22s var(--ease)}}
-.source summary::-webkit-details-marker{{display:none}}
-.source summary::after{{content:"+";font-size:18px;font-weight:400;color:var(--muted);transition:transform .3s var(--ease),color .3s var(--ease)}}
-.source[open] summary::after{{transform:rotate(45deg);color:var(--text)}}
-.source summary:hover{{background:rgba(255,255,255,.03)}}
-.source summary span{{color:var(--muted);font:500 10px "JetBrains Mono",monospace}}
-.source-body{{border-top:1px solid var(--line);padding:16px 20px;animation:openBody .3s var(--ease) both}}
-.source .kv{{grid-template-columns:140px 1fr}}
-.source .kv div{{border-bottom:1px solid var(--line)}}
-footer{{border-top:1px solid var(--line);padding:28px 0;color:var(--muted);font-size:11px;font-weight:600;background:rgba(255,255,255,.012);border-radius:var(--r-lg) var(--r-lg) 0 0;margin-top:30px}}
-.reveal{{opacity:0;transform:translateY(18px);transition:opacity .6s var(--ease),transform .6s var(--ease)}}
-.reveal.show{{opacity:1;transform:none}}
-@keyframes fadeUp{{from{{opacity:0;transform:translateY(14px)}}to{{opacity:1;transform:none}}}}
-@keyframes bar{{from{{transform:scaleX(0)}}}}
-@keyframes openBody{{from{{opacity:0;transform:translateY(-6px)}}to{{opacity:1;transform:none}}}}
-@media(max-width:800px){{
-  .wrap{{padding:0 16px}}
-  .top{{height:auto}}
-  .topbar{{min-height:64px;padding:12px 0;flex-wrap:wrap;gap:14px}}
-  .search{{order:3;flex-basis:100%;max-width:none;margin:0}}
-  .actions{{margin-left:auto}}
-  .actions .btn:first-child{{display:none}}
-  .hero{{padding:34px 0 26px;border-radius:var(--r-lg)}}
-  .hero h1{{font-size:34px}}
-  .navrow{{gap:20px;padding:0 18px}}
-  .summary,.grid2,.sources{{grid-template-columns:1fr}}
-  .metric{{border-right:0}}
-  .metric:nth-last-child(-n+3){{border-bottom:1px solid var(--line)}}
-  .metric:last-child{{border-bottom:0}}
-  .kv{{grid-template-columns:120px 1fr}}
-  th,td{{padding:10px 12px}}
-  th:nth-child(3),td:nth-child(3){{display:none}}
-  .source .kv{{grid-template-columns:110px 1fr}}
-}}
-@media(prefers-reduced-motion:reduce){{
-  *,*::before,*::after{{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important;scroll-behavior:auto!important}}
-}}
-::selection{{background:rgba(255,255,255,.22);color:#fff}}
-::-webkit-scrollbar{{width:10px;height:10px}}
-::-webkit-scrollbar-track{{background:transparent}}
-::-webkit-scrollbar-thumb{{background:rgba(255,255,255,.12);border:3px solid transparent;background-clip:padding-box;border-radius:var(--r-pill)}}
-::-webkit-scrollbar-thumb:hover{{background:rgba(255,255,255,.22);background-clip:padding-box}}
-a{{color:var(--text);text-decoration:none}}
-</style>
-</head>
+<style>{CSS}</style></head>
 <body>
-<header class="top"><div class="wrap topbar">
-<div class="brand">CrustySearch <span>/ Report</span></div>
-<input class="search" placeholder="Поиск по отчету…">
-<div class="actions">
-<button class="btn" onclick="navigator.clipboard?.writeText(location.href)">Копировать</button>
-<a class="btn" href="https://t.me/CrustySearch" target="_blank" rel="noopener">CrustySearch</a>
-</div>
+<header class="top"><div class="wrap" style="display:flex;align-items:center;gap:16px;width:100%">
+<div class="brand">CrustySearch / Report</div>
+<div style="margin-left:auto"><a href="https://t.me/CrustySearch" style="color:#fff">CrustySearch</a></div>
 </div></header>
-
-<div class="hero"><div class="wrap">
-<div class="crumb">Отчёт / <span class="mono">{esc(report_id)}</span> <span class="badge">{esc(qtype_name or "ПОИСК")}</span></div>
+<div class="wrap">
+<div class="hero">
+<div style="color:#888;font-size:12px">Отчёт / {esc(report_id)} · {esc(qtype_name or "ПОИСК")}</div>
 <h1>{esc(query)}</h1>
-<div class="sub">Найдено записей <span class="mono">{total_records}</span> · Источников <span class="mono">{sources_count}</span></div>
-</div></div>
-
-<nav class="nav"><div class="navrow wrap">
-<a href="#summary">Краткая сводка</a>
-<a href="#profiles">Профили</a>
-<a href="#identifiers">Идентификаторы</a>
-<a href="#aliases">Возможные имена</a>
-<a href="#addresses">Адреса</a>
-<a href="#sources">Расширенный отчет</a>
-</div></nav>
-
-<main class="wrap">
-<div class="notice">ОТЧЁТ СФОРМИРОВАН · {now} · Все данные получены из открытых источников.</div>
-
+<div class="sub">Записей: {total_records} · Источников: {sources_count}</div>
+</div>
+<div class="notice">ОТЧЁТ СФОРМИРОВАН · {now} · Данные из открытых источников</div>
 {self_html}
-
-<section id="summary" class="reveal">
+<section id="summary">
 <div class="section-title"><h2>Краткая сводка</h2><p>Сводные данные</p></div>
 <div class="card summary">{summary_html}</div>
 </section>
-
-<section class="reveal">
-<div class="grid2">
+<section><div class="grid2">
 <div class="panel"><h3>Найденные личности</h3>{identity_rows}</div>
 <div class="panel"><h3>Основные идентификаторы</h3><div class="kv">{kv_rows}</div></div>
-</div>
-</section>
-
-<section id="profiles" class="reveal">
+</div></section>
+<section id="profiles">
 <div class="section-title"><h2>Профили в интернете</h2><p>{total_records} записей</p></div>
 <div class="card"><table><thead><tr><th>Источник</th><th>Имя / никнейм</th><th>Идентификатор</th></tr></thead><tbody>{profiles_rows}</tbody></table></div>
 </section>
-
-<section id="identifiers" class="reveal">
+<section id="identifiers">
 <div class="section-title"><h2>Идентификаторы</h2><p>телефоны и email</p></div>
 <div class="panel">{phones_tags}{emails_tags}</div>
 </section>
-
-<section id="aliases" class="reveal">
+<section id="aliases">
 <div class="section-title"><h2>Возможные имена</h2><p>{len(fio_all)} вариантов</p></div>
 <div class="panel">{aliases_html}</div>
 </section>
-
-<section id="addresses" class="reveal">
+<section id="addresses">
 <div class="section-title"><h2>Адреса и регионы</h2><p>{len(regions_all)} вариантов</p></div>
 <div class="panel">{addresses_html}</div>
 </section>
-
-<section id="sources" class="reveal">
+<section id="sources">
 <div class="section-title"><h2>Расширенный отчет</h2><p>источники и поля</p></div>
-<div class="sources">{sources_html}</div>
+{sources_html}
 </section>
-</main>
-
-<footer><div class="wrap">CrustySearch · Report · {now}</div></footer>
-
-<script>
-const io=new IntersectionObserver(es=>es.forEach(e=>{{if(e.isIntersecting)e.target.classList.add("show")}}),{{threshold:.08}});
-document.querySelectorAll(".reveal").forEach(x=>io.observe(x));
-document.querySelector(".search").addEventListener("input",e=>{{
-  const q=e.target.value.toLowerCase().trim();
-  document.querySelectorAll("section,.source,.panel").forEach(x=>{{
-    x.style.outline = (q && x.innerText.toLowerCase().includes(q)) ? "2px solid rgba(255,255,255,.35)" : "";
-  }});
-}});
-</script>
+<footer>CrustySearch · Report · {now}</footer>
+</div>
 </body></html>"""
 
 
@@ -1126,7 +1322,6 @@ def generate_payment_code() -> str:
 
 
 async def _db_connect():
-    """Единая точка подключения с оптимизациями под фри-хостинг."""
     db = await aiosqlite.connect(DB_PATH)
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA busy_timeout=8000")
@@ -1173,14 +1368,10 @@ async def init_db():
         user_id INTEGER NOT NULL, delivery_status TEXT DEFAULT 'sent',
         error_description TEXT DEFAULT '', delivery_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
     await db.execute("""CREATE TABLE IF NOT EXISTS self_lookup (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        hash_key TEXT UNIQUE NOT NULL,
-        phone_masked TEXT DEFAULT '',
-        owner_user_id INTEGER NOT NULL,
-        owner_username TEXT DEFAULT '',
-        owner_first_name TEXT DEFAULT '',
-        owner_last_name TEXT DEFAULT '',
-        source TEXT DEFAULT 'auto',
+        id INTEGER PRIMARY KEY AUTOINCREMENT, hash_key TEXT UNIQUE NOT NULL,
+        phone_masked TEXT DEFAULT '', owner_user_id INTEGER NOT NULL,
+        owner_username TEXT DEFAULT '', owner_first_name TEXT DEFAULT '',
+        owner_last_name TEXT DEFAULT '', source TEXT DEFAULT 'auto',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_self_lookup_hash ON self_lookup(hash_key)")
     await db.commit()
@@ -1247,11 +1438,9 @@ async def check_daily_bonus(uid):
     db = await _db_connect()
     cur = await db.execute("SELECT last_daily_bonus FROM users WHERE user_id=?", (uid,))
     row = await cur.fetchone()
-    if not row:
-        await db.close(); return False
+    if not row: await db.close(); return False
     last = row[0]; give = False
-    if not last:
-        give = True
+    if not last: give = True
     else:
         try:
             if (datetime.now() - datetime.strptime(last, "%Y-%m-%d %H:%M:%S.%f")).total_seconds() >= 86400:
@@ -1269,11 +1458,9 @@ async def set_referrer(uid, ref):
     db = await _db_connect()
     cur = await db.execute("SELECT referrer_id FROM users WHERE user_id=?", (uid,))
     r = await cur.fetchone()
-    if r and r[0] and r[0] != 0:
-        await db.close(); return
+    if r and r[0] and r[0] != 0: await db.close(); return
     cur = await db.execute("SELECT user_id FROM users WHERE user_id=?", (ref,))
-    if not await cur.fetchone():
-        await db.close(); return
+    if not await cur.fetchone(): await db.close(); return
     await db.execute("UPDATE users SET referrer_id=? WHERE user_id=?", (ref, uid))
     await db.commit(); await db.close()
     try: await bot.send_message(ref, "🎉 По вашей ссылке зарегистрировался новый пользователь!")
@@ -1374,10 +1561,8 @@ async def try_approve(pid, aid):
         cur = await db.execute("SELECT status, admin_id FROM payments WHERE payment_id=?", (pid,))
         r = await cur.fetchone()
         if not r: await db.rollback(); return False, "not_found"
-        if r["status"] == "approved":
-            await db.rollback(); return False, f"already_approved:{r['admin_id']}"
-        if r["status"] == "rejected":
-            await db.rollback(); return False, "already_rejected"
+        if r["status"] == "approved": await db.rollback(); return False, f"already_approved:{r['admin_id']}"
+        if r["status"] == "rejected": await db.rollback(); return False, "already_rejected"
         await db.execute("UPDATE payments SET status='approved', admin_id=?, processed_date=CURRENT_TIMESTAMP WHERE payment_id=?",
                          (aid, pid))
         await db.commit(); return True, "ok"
@@ -1395,10 +1580,8 @@ async def try_reject(pid, aid):
         cur = await db.execute("SELECT status, admin_id FROM payments WHERE payment_id=?", (pid,))
         r = await cur.fetchone()
         if not r: await db.rollback(); return False, "not_found"
-        if r["status"] == "approved":
-            await db.rollback(); return False, f"already_approved:{r['admin_id']}"
-        if r["status"] == "rejected":
-            await db.rollback(); return False, "already_rejected"
+        if r["status"] == "approved": await db.rollback(); return False, f"already_approved:{r['admin_id']}"
+        if r["status"] == "rejected": await db.rollback(); return False, "already_rejected"
         await db.execute("UPDATE payments SET status='rejected', admin_id=?, processed_date=CURRENT_TIMESTAMP WHERE payment_id=?",
                          (aid, pid))
         await db.commit(); return True, "ok"
@@ -1542,19 +1725,15 @@ _OK_STATUSES = {"creator", "administrator", "member"}
 
 
 async def check_subscription(bot_instance, user_id):
-    if user_id in ADMINS:
-        return []
+    if user_id in ADMINS: return []
     now = time.monotonic()
-    not_sub = []
-    to_check = []
+    not_sub, to_check = [], []
     for ch in CHANNELS:
         key = (user_id, ch["id"])
         cached = _sub_cache.get(key)
         if cached and (now - cached[1]) < _SUB_CACHE_TTL:
-            if not cached[0]:
-                not_sub.append(ch)
-        else:
-            to_check.append(ch)
+            if not cached[0]: not_sub.append(ch)
+        else: to_check.append(ch)
     for ch in to_check:
         try:
             m = await bot_instance.get_chat_member(ch["id"], user_id)
@@ -1562,9 +1741,7 @@ async def check_subscription(bot_instance, user_id):
             status_str = status if isinstance(status, str) else getattr(status, "value", str(status))
             is_ok = status_str in _OK_STATUSES
             _sub_cache[(user_id, ch["id"])] = (is_ok, now)
-            logger.info(f"[sub] user={user_id} ch={ch['name']} status={status_str} ok={is_ok}")
-            if not is_ok:
-                not_sub.append(ch)
+            if not is_ok: not_sub.append(ch)
         except Exception as ex:
             logger.warning(f"[sub] check failed user={user_id} ch={ch['name']}: {ex}")
     return not_sub
@@ -1586,15 +1763,13 @@ SUB_TEXT = "🔒 <b>Подпишись на каналы чтобы пользо
 
 class SubscriptionMiddleware:
     def __init__(self, channels, admin_list):
-        self.channels = channels
-        self.admin_list = admin_list
+        self.channels = channels; self.admin_list = admin_list
 
     async def __call__(self, handler, event, data):
         if not hasattr(event, "from_user") or not event.from_user:
             return await handler(event, data)
         uid = event.from_user.id
-        if uid in self.admin_list:
-            return await handler(event, data)
+        if uid in self.admin_list: return await handler(event, data)
         if isinstance(event, Message) and event.text and event.text.startswith("/start"):
             return await handler(event, data)
         if isinstance(event, CallbackQuery) and event.data == "check_sub":
@@ -1602,8 +1777,6 @@ class SubscriptionMiddleware:
         bot_instance = data.get("bot")
         not_sub = await check_subscription(bot_instance, uid)
         if not_sub:
-            names = ", ".join(c["name"] for c in not_sub)
-            logger.info(f"[sub] BLOCK user={uid} not_sub={names}")
             if isinstance(event, Message):
                 await event.answer(SUB_TEXT, reply_markup=sub_kb(not_sub), parse_mode="HTML")
             elif isinstance(event, CallbackQuery):
@@ -1616,17 +1789,17 @@ class SubscriptionMiddleware:
 
 
 class OperationStates(StatesGroup):
-    waiting_for_proof = State()
-    waiting_for_query = State()
-    admin_broadcast = State()
-    admin_search_user = State()
-    admin_add_queries = State()
+    waiting_for_proof    = State()
+    waiting_for_query    = State()
+    admin_broadcast      = State()
+    admin_search_user    = State()
+    admin_add_queries    = State()
     admin_remove_queries = State()
-    admin_add_balance = State()
-    admin_edit_note = State()
-    admin_add_sticker = State()
-    support_message = State()
-    creating_bot_token = State()
+    admin_add_balance    = State()
+    admin_edit_note      = State()
+    admin_add_sticker    = State()
+    support_message      = State()
+    creating_bot_token   = State()
 
 
 bot = Bot(token=API_TOKEN)
@@ -1635,14 +1808,36 @@ payment_proof = {}
 payment_proof_method = {}
 payment_code = {}
 running_user_bots = {}
-user_results = {}
 _running_tokens = set()
 _running_bids = set()
 _running_lock = asyncio.Lock()
-# _shutdown_event создаётся внутри main(), в актуальном event loop
+
+# Персистентный кеш последнего пробива (JSON в FSM)
+async def save_user_result(state: FSMContext, payload: dict):
+    try:
+        s = json.dumps(payload, ensure_ascii=False)
+        if len(s) > 60000:  # слишком большой — не сохраняем
+            await state.update_data(last_result=None)
+            return
+        await state.update_data(last_result=s)
+    except Exception as ex:
+        logger.warning(f"[user_result] save fail: {ex}")
+        await state.update_data(last_result=None)
+
+
+async def load_user_result(state: FSMContext) -> Optional[dict]:
+    try:
+        d = await state.get_data()
+        s = d.get("last_result")
+        if not s: return None
+        return json.loads(s)
+    except Exception as ex:
+        logger.warning(f"[user_result] load fail: {ex}")
+        return None
+
 
 # ============================================================
-# UI
+# UI helpers
 # ============================================================
 async def _edit_media(message, img, caption, kb):
     has = img and os.path.exists(img)
@@ -1996,7 +2191,6 @@ async def h_query(message: Message, state: FSMContext):
                          message.from_user.last_name or "")
 
     qtype, api_str, qtype_name = detect_query_type(raw)
-
     info = await get_user_full_info(uid) or {}
     ql = info.get("queries_left", 0) or 0
     bal = info.get("balance", 0.0) or 0.0
@@ -2027,47 +2221,27 @@ async def h_query(message: Message, state: FSMContext):
             hit = await self_lookup_find(normalized_phone)
             if hit:
                 owner_id, owner_un, owner_fn, owner_ln, src, created = hit
-                if owner_id != uid:
-                    self_binding = hit
+                if owner_id != uid: self_binding = hit
         except Exception as ex:
             logger.warning(f"self_lookup_find: {ex}")
 
     if qtype == "nick":
         username = raw.lstrip("@").replace("nick:", "").strip()
         try:
-            result = await search_by_username(username)
-            api_error = None
+            result = await search_by_username(username); api_error = None
         except APIUnavailable as ex:
             result = None; api_error = str(ex)
         except Exception as ex:
-            logger.error(f"search_by_username err: {ex}")
-            result = None; api_error = "unknown"
+            logger.error(f"search_by_username err: {ex}"); result = None; api_error = "unknown"
 
-        if api_error:
+        if api_error or not result:
             if uid not in ADMINS: await add_queries(uid, 1)
             info = await get_user_full_info(uid) or {}
             left = info.get("queries_left", 0) or 0
-            bal = info.get("balance", 0.0) or 0.0
-            lt = "∞" if uid in ADMINS else str(left)
-            txt = (f"⚠️ <b>{h_esc(friendly_api_error(api_error))}</b>\n\n"
+            bal  = info.get("balance", 0.0) or 0.0
+            lt   = "∞" if uid in ADMINS else str(left)
+            txt = (f"⚠️ <b>{h_esc(friendly_api_error(api_error or 'not_found'))}</b>\n\n"
                    f"📌 Запрос: <code>{safe_query_for_html(raw)}</code>\n\n"
-                   f"<i>Запрос возвращён на баланс.</i>\n\n"
-                   f"{EMOJI_FIND} Запросов: {lt} | 💰 Баланс: {bal:.2f}₽")
-            try:
-                await msg.edit_text(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="Меню", callback_data="back_to_main_menu", style="danger")]]),
-                    parse_mode="HTML")
-            except Exception: pass
-            await state.clear(); return
-
-        if not result:
-            if uid not in ADMINS: await add_queries(uid, 1)
-            info = await get_user_full_info(uid) or {}
-            left = info.get("queries_left", 0) or 0
-            bal = info.get("balance", 0.0) or 0.0
-            lt = "∞" if uid in ADMINS else str(left)
-            txt = (f"❌ <b>Ничего не найдено</b>\n\n"
-                   f"👤 Ник: <code>@{h_esc(username)}</code>\n\n"
                    f"<i>Запрос возвращён.</i>\n\n"
                    f"{EMOJI_FIND} Запросов: {lt} | 💰 Баланс: {bal:.2f}₽")
             try:
@@ -2077,29 +2251,29 @@ async def h_query(message: Message, state: FSMContext):
             except Exception: pass
             await state.clear(); return
 
-        user_results[uid] = {"query": raw, "username_result": result, "is_username": True}
+        payload = {"query": raw, "username_result": result, "is_username": True}
+        await save_user_result(state, payload)
+
         info = await get_user_full_info(uid) or {}
         left = info.get("queries_left", 0) or 0
-        bal = info.get("balance", 0.0) or 0.0
-        lt = "∞" if uid in ADMINS else str(left)
+        bal  = info.get("balance", 0.0) or 0.0
+        lt   = "∞" if uid in ADMINS else str(left)
         formatted = format_username_result(username, result)
         formatted += f"\n\n💳 <b>Оплата:</b> {h_esc(pay_note)}"
         formatted += f"\n{EMOJI_FIND} <b>Запросов:</b> {lt} | 💰 <b>Баланс:</b> {bal:.2f}₽"
-        if len(formatted) > 4000:
-            formatted = formatted[:4000] + "\n\n… Обрезано. HTML полный."
+        if len(formatted) > 4000: formatted = formatted[:4000] + "\n\n… Обрезано. HTML полный."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Скачать HTML", callback_data="download_html",
+                                  style="success", icon_custom_emoji_id=E_FIND)],
+            [InlineKeyboardButton(text="Сделать цепочку", callback_data="build_chain",
+                                  style="primary", icon_custom_emoji_id=E_LINK)],
+            [InlineKeyboardButton(text="Меню", callback_data="back_to_main_menu", style="danger")]])
         try:
-            await msg.edit_text(formatted, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Скачать HTML", callback_data="download_html",
-                                      style="success", icon_custom_emoji_id=E_FIND)],
-                [InlineKeyboardButton(text="Меню", callback_data="back_to_main_menu", style="danger")]]),
-                parse_mode="HTML")
+            await msg.edit_text(formatted, reply_markup=kb, parse_mode="HTML")
         except TelegramBadRequest:
-            await message.answer(formatted, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Скачать HTML", callback_data="download_html",
-                                      style="success", icon_custom_emoji_id=E_FIND)],
-                [InlineKeyboardButton(text="Меню", callback_data="back_to_main_menu", style="danger")]]),
-                parse_mode="HTML")
-        await state.clear(); return
+            await message.answer(formatted, reply_markup=kb, parse_mode="HTML")
+        await state.set_state(None)  # не clear, чтобы сохранилось last_result
+        return
 
     if qtype == "phone":
         api_str = normalized_phone
@@ -2110,33 +2284,16 @@ async def h_query(message: Message, state: FSMContext):
     except APIUnavailable as ex:
         api_error = str(ex)
     except Exception as ex:
-        logger.error(f"api_query err: {ex}")
-        api_error = "unknown"
+        logger.error(f"api_query err: {ex}"); api_error = "unknown"
 
-    if api_error:
+    if api_error or not ok:
         if uid not in ADMINS: await add_queries(uid, 1)
         info = await get_user_full_info(uid) or {}
         left = info.get("queries_left", 0) or 0
-        bal = info.get("balance", 0.0) or 0.0
-        lt = "∞" if uid in ADMINS else str(left)
-        txt = (f"⚠️ <b>{h_esc(friendly_api_error(api_error))}</b>\n\n"
-               f"📌 Запрос: <code>{safe_query_for_html(raw)}</code>\n\n"
-               f"<i>Запрос возвращён на баланс.</i>\n\n"
-               f"{EMOJI_FIND} Запросов: {lt} | 💰 Баланс: {bal:.2f}₽")
-        try:
-            await msg.edit_text(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Меню", callback_data="back_to_main_menu", style="danger")]]),
-                parse_mode="HTML")
-        except Exception: pass
-        await state.clear(); return
-
-    if not ok:
-        if uid not in ADMINS: await add_queries(uid, 1)
-        info = await get_user_full_info(uid) or {}
-        left = info.get("queries_left", 0) or 0
-        bal = info.get("balance", 0.0) or 0.0
-        lt = "∞" if uid in ADMINS else str(left)
-        txt = (f"⚠️ <b>{h_esc(friendly_api_error(data or 'unknown'))}</b>\n\n"
+        bal  = info.get("balance", 0.0) or 0.0
+        lt   = "∞" if uid in ADMINS else str(left)
+        reason = api_error or (data if isinstance(data, str) else "unknown")
+        txt = (f"⚠️ <b>{h_esc(friendly_api_error(reason))}</b>\n\n"
                f"📌 Запрос: <code>{safe_query_for_html(raw)}</code>\n\n"
                f"<i>Запрос возвращён.</i>\n\n"
                f"{EMOJI_FIND} Запросов: {lt} | 💰 Баланс: {bal:.2f}₽")
@@ -2152,47 +2309,42 @@ async def h_query(message: Message, state: FSMContext):
             has_any = bool(data and (data.get("results") or data.get("phone_info") or data.get("ip_info")))
             match = _match_owner_in_result(message.from_user, data) if data else False
             if has_any or match:
-                saved = await self_lookup_save(
-                    normalized_phone,
-                    uid,
+                await self_lookup_save(
+                    normalized_phone, uid,
                     message.from_user.username or "",
                     message.from_user.first_name or "",
                     message.from_user.last_name or "",
-                    source="auto_match" if match else "auto_first"
-                )
-                if saved:
-                    logger.info(f"[self_lookup] saved {normalized_phone} -> {uid} (match={match})")
+                    source="auto_match" if match else "auto_first")
         except Exception as ex:
             logger.warning(f"self_lookup_save: {ex}")
 
-    user_results[uid] = {"query": raw, "data": data, "qtype_name": qtype_name}
+    payload = {"query": raw, "data": data, "qtype_name": qtype_name, "self_binding": self_binding}
+    await save_user_result(state, payload)
+
     info = await get_user_full_info(uid) or {}
     left = info.get("queries_left", 0) or 0
-    bal = info.get("balance", 0.0) or 0.0
-    lt = "∞" if uid in ADMINS else str(left)
+    bal  = info.get("balance", 0.0) or 0.0
+    lt   = "∞" if uid in ADMINS else str(left)
     formatted = format_results(raw, data, qtype_name=qtype_name, self_binding=self_binding)
     formatted += f"\n\n💳 <b>Оплата:</b> {h_esc(pay_note)}"
     formatted += f"\n{EMOJI_FIND} <b>Запросов:</b> {lt} | 💰 <b>Баланс:</b> {bal:.2f}₽"
-    if len(formatted) > 4000:
-        formatted = formatted[:4000] + "\n\n… Обрезано. HTML полный."
+    if len(formatted) > 4000: formatted = formatted[:4000] + "\n\n… Обрезано. HTML полный."
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Скачать HTML", callback_data="download_html",
+                              style="success", icon_custom_emoji_id=E_FIND)],
+        [InlineKeyboardButton(text="Сделать цепочку", callback_data="build_chain",
+                              style="primary", icon_custom_emoji_id=E_LINK)],
+        [InlineKeyboardButton(text="Меню", callback_data="back_to_main_menu", style="danger")]])
     try:
-        await msg.edit_text(formatted, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Скачать HTML", callback_data="download_html",
-                                  style="success", icon_custom_emoji_id=E_FIND)],
-            [InlineKeyboardButton(text="Меню", callback_data="back_to_main_menu", style="danger")]]),
-            parse_mode="HTML")
+        await msg.edit_text(formatted, reply_markup=kb, parse_mode="HTML")
     except TelegramBadRequest:
-        await message.answer(formatted, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Скачать HTML", callback_data="download_html",
-                                  style="success", icon_custom_emoji_id=E_FIND)],
-            [InlineKeyboardButton(text="Меню", callback_data="back_to_main_menu", style="danger")]]),
-            parse_mode="HTML")
-    await state.clear()
+        await message.answer(formatted, reply_markup=kb, parse_mode="HTML")
+    await state.set_state(None)  # не clear, чтобы сохранилось last_result
 
 
-async def h_download_html(cb: CallbackQuery):
+async def h_download_html(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
-    saved = user_results.get(cb.from_user.id)
+    saved = await load_user_result(state)
     if not saved:
         await cb.answer("Сначала сделай поиск.", show_alert=True); return
     query = saved["query"]
@@ -2216,6 +2368,56 @@ async def h_download_html(cb: CallbackQuery):
     except Exception: pass
 
 
+async def h_build_chain(cb: CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    logger.info(f"[chain] handler called by {uid}")
+    try: await cb.answer("Строю цепочку...")
+    except Exception: pass
+
+    try:
+        saved = await load_user_result(state)
+        if not saved:
+            try: await cb.message.answer("⚠️ Сначала сделай поиск.")
+            except Exception: pass
+            return
+
+        query = saved["query"]
+        qtype = saved.get("qtype_name", "")
+        data = saved.get("data") or {}
+        username_result = saved.get("username_result")
+        if username_result and not data:
+            data = {"results": []}
+            for _src, raw in username_result.get("extra", []):
+                for item in (raw.get("results") or []):
+                    data["results"].append(item)
+
+        chain = build_chain_data(data, query, qtype)
+        logger.info(f"[chain] built: root={chain['root']}, mid={len(chain['mid'])}, right={len(chain['right'])}")
+
+        html = render_chain_html(chain)
+        safe = re.sub(r"[^\w\-]", "_", query)[:40] or "chain"
+        fname = f"chain_{safe}.html"
+        path = os.path.join(BASE_DIR, fname)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        logger.info(f"[chain] wrote {path} ({len(html)} bytes)")
+
+        await cb.message.answer_document(
+            FSInputFile(path, filename=fname),
+            caption=f"🔗 Цепочка по запросу: {query}",
+        )
+        try: os.remove(path)
+        except Exception: pass
+        logger.info(f"[chain] sent to {uid}")
+
+    except Exception as ex:
+        logger.exception(f"[chain] FAIL: {ex}")
+        try:
+            await cb.message.answer(f"⚠️ Ошибка цепочки:\n<code>{h_esc(str(ex))}</code>", parse_mode="HTML")
+        except Exception:
+            pass
+
+
 async def h_profile(cb: CallbackQuery):
     await cb.answer()
     info = await get_user_full_info(cb.from_user.id) or {}
@@ -2223,7 +2425,7 @@ async def h_profile(cb: CallbackQuery):
     uid = info.get("user_id", cb.from_user.id)
     left = info.get("queries_left", 0) or 0
     lt = "∞" if uid in ADMINS else str(left)
-    bal = info.get("balance", 0.0) or 0.0
+    bal  = info.get("balance", 0.0) or 0.0
     rbal = info.get("ref_balance", 0.0) or 0.0
     ref_link = f"https://t.me/{BOT_USERNAME}?start=ref{uid}"
     txt = (f"{EMOJI_PROFILE} <b>Профиль</b>\n\nВаш ID: <code>{uid}</code>\n"
@@ -2354,8 +2556,7 @@ async def h_proof(message: Message, state: FSMContext):
                 await message.bot.send_video(adm, message.video.file_id, caption=admin_text, reply_markup=kb, parse_mode="HTML")
             else:
                 await message.bot.send_message(adm, admin_text, reply_markup=kb, parse_mode="HTML")
-        except Exception as ex:
-            logger.error(f"notif adm: {ex}")
+        except Exception as ex: logger.error(f"notif adm: {ex}")
     await state.clear()
     await message.answer("Заявка на рассмотрении.", reply_markup=main_menu_kb(uid))
 
@@ -2364,8 +2565,7 @@ async def h_adm_ok(cb: CallbackQuery):
     if cb.from_user.id not in ADMINS:
         await cb.answer("Доступ запрещён.", show_alert=True); return
     try: pid = int(cb.data.split("_")[2])
-    except Exception:
-        await cb.answer("Ошибка.", show_alert=True); return
+    except Exception: await cb.answer("Ошибка.", show_alert=True); return
     ok, reason = await try_approve(pid, cb.from_user.id)
     if not ok:
         try: await cb.message.edit_reply_markup(reply_markup=None)
@@ -2374,8 +2574,7 @@ async def h_adm_ok(cb: CallbackQuery):
             await cb.answer(f"❌ Уже обработано {reason.split(':')[1]}", show_alert=True)
         elif reason == "already_rejected":
             await cb.answer("❌ Уже отклонена.", show_alert=True)
-        else:
-            await cb.answer("Ошибка.", show_alert=True)
+        else: await cb.answer("Ошибка.", show_alert=True)
         return
     info = await get_payment_info(pid)
     if info:
@@ -2400,8 +2599,7 @@ async def h_adm_no(cb: CallbackQuery):
     if cb.from_user.id not in ADMINS:
         await cb.answer("Доступ запрещён.", show_alert=True); return
     try: pid = int(cb.data.split("_")[2])
-    except Exception:
-        await cb.answer("Ошибка.", show_alert=True); return
+    except Exception: await cb.answer("Ошибка.", show_alert=True); return
     ok, reason = await try_reject(pid, cb.from_user.id)
     if not ok:
         try: await cb.message.edit_reply_markup(reply_markup=None)
@@ -2410,8 +2608,7 @@ async def h_adm_no(cb: CallbackQuery):
             await cb.answer(f"❌ Уже одобрено {reason.split(':')[1]}", show_alert=True)
         elif reason == "already_rejected":
             await cb.answer("❌ Уже отклонена.", show_alert=True)
-        else:
-            await cb.answer("Ошибка.", show_alert=True)
+        else: await cb.answer("Ошибка.", show_alert=True)
         return
     info = await get_payment_info(pid)
     if info:
@@ -2451,8 +2648,7 @@ async def h_support_msg(message: Message, state: FSMContext):
             await message.bot.send_video(ADMINS[0], message.video.file_id, caption=txt)
         else:
             await message.bot.send_message(ADMINS[0], f"{txt}\n\n{message.text}")
-    except Exception as ex:
-        logger.error(f"support: {ex}")
+    except Exception as ex: logger.error(f"support: {ex}")
     await message.answer("Отправлено.")
     await state.clear()
     await message.answer("Меню:", reply_markup=main_menu_kb(uid))
@@ -2568,10 +2764,10 @@ async def h_admin_stats(cb: CallbackQuery):
     await cb.answer()
     if cb.from_user.id not in ADMINS: return
     db = await _db_connect()
-    total = (await (await db.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
-    banned = (await (await db.execute("SELECT COUNT(*) FROM users WHERE banned=1")).fetchone())[0]
-    pend = (await (await db.execute("SELECT COUNT(*) FROM payments WHERE status='pending'")).fetchone())[0]
-    ubots = (await (await db.execute("SELECT COUNT(*) FROM user_bots WHERE is_active=1")).fetchone())[0]
+    total   = (await (await db.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
+    banned  = (await (await db.execute("SELECT COUNT(*) FROM users WHERE banned=1")).fetchone())[0]
+    pend    = (await (await db.execute("SELECT COUNT(*) FROM payments WHERE status='pending'")).fetchone())[0]
+    ubots   = (await (await db.execute("SELECT COUNT(*) FROM user_bots WHERE is_active=1")).fetchone())[0]
     sl_count = (await (await db.execute("SELECT COUNT(*) FROM self_lookup")).fetchone())[0]
     await db.close()
     st = await get_stickers()
@@ -2809,7 +3005,6 @@ async def h_admin_bc(cb: CallbackQuery, state: FSMContext):
 
 
 async def h_admin_bc_h(message: Message, state: FSMContext):
-    """Оптимизированная рассылка с семафором."""
     if message.from_user.id not in ADMINS: return
     mt = "text"; mtext = message.text or ""; mfile = ""
     if message.photo: mt, mfile, mtext = "photo", message.photo[-1].file_id, message.caption or ""
@@ -2819,7 +3014,6 @@ async def h_admin_bc_h(message: Message, state: FSMContext):
     users = await get_all_users()
     total = len(users); sent = failed = 0
     sm = await message.bot.send_message(ADMINS[0], f"Начата: {total}")
-
     sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
 
     async def send_one(u):
@@ -2857,6 +3051,7 @@ def create_router():
     r.callback_query(F.data == "cancel_find")(h_cancel_find)
     r.message(StateFilter(OperationStates.waiting_for_query))(h_query)
     r.callback_query(F.data == "download_html")(h_download_html)
+    r.callback_query(F.data == "build_chain")(h_build_chain)
     r.callback_query(F.data == "profile")(h_profile)
     r.callback_query(F.data == "menu_payment")(h_menu_payment)
     r.callback_query(F.data == "buy_access")(h_buy_access)
@@ -2905,111 +3100,48 @@ def create_router():
 
 
 # ============================================================
-# 🔥 БЕЗОПАСНЫЙ POLLING — ИСПРАВЛЕНИЕ TelegramConflictError
-# ============================================================
-# ============================================================
-# 🔥 БЕЗОПАСНЫЙ POLLING — ИСПРАВЛЕНИЕ TelegramConflictError
+# SAFE POLLING
 # ============================================================
 async def _force_delete_webhook(bot_instance: Bot) -> None:
-    """
-    Гарантированно снимает вебхук + drop_pending.
-    Вызывается ПЕРЕД каждым start_polling (главный + зеркала).
-    """
     try:
         info = await bot_instance.get_webhook_info()
         if info and info.url:
             logger.warning(f"[webhook] Обнаружен активный webhook: {info.url}. Удаляю...")
-    except Exception as ex:
-        logger.debug(f"[webhook] get_webhook_info: {ex}")
+    except Exception as ex: logger.debug(f"[webhook] get_webhook_info: {ex}")
     try:
         await bot_instance.delete_webhook(drop_pending_updates=True)
         logger.info("[webhook] delete_webhook выполнен.")
-    except Exception as ex:
-        logger.warning(f"[webhook] delete_webhook: {ex}")
+    except Exception as ex: logger.warning(f"[webhook] delete_webhook: {ex}")
 
 
 async def safe_start_polling(dp: Dispatcher, bot_instance: Bot, label: str = "main") -> None:
-    """
-    Безопасный polling с ретраями при TelegramConflictError.
-    КЛЮЧЕВОЕ: перед КАЖДОЙ попыткой — delete_webhook + drop_pending.
-    """
     last_exc = None
     for attempt in range(1, POLLING_MAX_RETRIES + 1):
         await _force_delete_webhook(bot_instance)
-        # Пауза, чтобы Telegram успел освободить сессию от предыдущего long-poll
         await asyncio.sleep(POLLING_PRE_DELAY)
-
         try:
             logger.info(f"[{label}] start_polling, попытка {attempt}/{POLLING_MAX_RETRIES}")
             await dp.start_polling(
                 bot_instance,
                 drop_pending_updates=True,
                 allowed_updates=dp.resolve_used_update_types(),
-                handle_signals=False,   # сигналы обрабатываем сами
+                handle_signals=False,
             )
             return
         except TelegramConflictError as ex:
             last_exc = ex
             wait = min(POLLING_RETRY_DELAY * attempt, 60)
-            logger.warning(
-                f"[{label}] TelegramConflictError (попытка {attempt}): {ex}. "
-                f"Жду {wait:.1f} сек и пробую снова..."
-            )
+            logger.warning(f"[{label}] TelegramConflictError (попытка {attempt}): {ex}. Жду {wait:.1f} сек.")
             await asyncio.sleep(wait)
         except asyncio.CancelledError:
-            logger.info(f"[{label}] polling отменён.")
-            raise
+            logger.info(f"[{label}] polling отменён."); raise
         except Exception as ex:
             last_exc = ex
             wait = min(POLLING_RETRY_DELAY * attempt, 60)
             logger.error(f"[{label}] Неожиданная ошибка polling: {ex}. Жду {wait:.1f} сек.")
             await asyncio.sleep(wait)
-
     logger.error(f"[{label}] Не удалось запустить polling за {POLLING_MAX_RETRIES} попыток.")
-    if last_exc:
-        raise last_exc
-
-
-async def safe_start_polling(dp: Dispatcher, bot_instance: Bot, label: str = "main") -> None:
-    """
-    Безопасный polling с ретраями при TelegramConflictError.
-    КЛЮЧЕВОЕ: перед КАЖДОЙ попыткой — delete_webhook + drop_pending.
-    """
-    last_exc = None
-    for attempt in range(1, POLLING_MAX_RETRIES + 1):
-        await _force_delete_webhook(bot_instance)
-        # Пауза, чтобы Telegram успел освободить сессию от предыдущего long-poll
-        await asyncio.sleep(POLLING_PRE_DELAY)
-
-        try:
-            logger.info(f"[{label}] start_polling, попытка {attempt}/{POLLING_MAX_RETRIES}")
-            await dp.start_polling(
-                bot_instance,
-                drop_pending_updates=True,
-                allowed_updates=dp.resolve_used_update_types(),
-                handle_signals=False,   # сигналы обрабатываем сами
-            )
-            return
-        except TelegramConflictError as ex:
-            last_exc = ex
-            wait = min(POLLING_RETRY_DELAY * attempt, 60)
-            logger.warning(
-                f"[{label}] TelegramConflictError (попытка {attempt}): {ex}. "
-                f"Жду {wait:.1f} сек и пробую снова..."
-            )
-            await asyncio.sleep(wait)
-        except asyncio.CancelledError:
-            logger.info(f"[{label}] polling отменён.")
-            raise
-        except Exception as ex:
-            last_exc = ex
-            wait = min(POLLING_RETRY_DELAY * attempt, 60)
-            logger.error(f"[{label}] Неожиданная ошибка polling: {ex}. Жду {wait:.1f} сек.")
-            await asyncio.sleep(wait)
-
-    logger.error(f"[{label}] Не удалось запустить polling за {POLLING_MAX_RETRIES} попыток.")
-    if last_exc:
-        raise last_exc
+    if last_exc: raise last_exc
 
 
 # ============================================================
@@ -3018,34 +3150,26 @@ async def safe_start_polling(dp: Dispatcher, bot_instance: Bot, label: str = "ma
 async def run_user_bot(bid, token, owner_id):
     async with _running_lock:
         if token in _running_tokens or bid in _running_bids:
-            logger.info(f"⏭ Зеркало #{bid} уже запущено.")
-            return
-        _running_tokens.add(token)
-        _running_bids.add(bid)
+            logger.info(f"⏭ Зеркало #{bid} уже запущено."); return
+        _running_tokens.add(token); _running_bids.add(bid)
         running_user_bots[bid] = {"bot": None, "task": asyncio.current_task()}
-
-    child = None
-    dp = None
+    child = None; dp = None
     try:
         child = Bot(token=token)
         me = await child.get_me()
         logger.info(f"🚀 Зеркало #{bid}: @{me.username}")
         running_user_bots[bid]["bot"] = child
-
         db = await _db_connect()
         await db.execute("UPDATE user_bots SET bot_username=?, bot_name=? WHERE bot_id=?",
                          (me.username or "", me.full_name or "", bid))
         await db.commit(); await db.close()
-
-        dp = Dispatcher(storage=MemoryStorage())
+        dp = Dispatcher(storage=make_storage())
+        dp.update.middleware(AntiSpamMiddleware())
         dp.update.middleware(SubscriptionMiddleware(CHANNELS, ADMINS))
         dp.include_router(create_router())
-
         await safe_start_polling(dp, child, label=f"bot#{bid}")
-
     except asyncio.CancelledError:
-        logger.info(f"🛑 Зеркало #{bid} остановлено.")
-        raise
+        logger.info(f"🛑 Зеркало #{bid} остановлено."); raise
     except Exception as ex:
         logger.error(f"❌ Зеркало #{bid}: {ex}")
     finally:
@@ -3053,8 +3177,7 @@ async def run_user_bot(bid, token, owner_id):
             try: await dp.storage.close()
             except Exception: pass
         async with _running_lock:
-            _running_tokens.discard(token)
-            _running_bids.discard(bid)
+            _running_tokens.discard(token); _running_bids.discard(bid)
             cur = running_user_bots.get(bid)
             if cur and cur.get("task") is asyncio.current_task():
                 running_user_bots.pop(bid, None)
@@ -3066,7 +3189,7 @@ async def run_user_bot(bid, token, owner_id):
 async def start_all_user_bots():
     bots = await get_active_user_bots()
     started = skipped = 0
-    seen_ids = set(); seen_tokens = set()
+    seen_ids, seen_tokens = set(), set()
     for bid, owner, tok in bots:
         if not tok: continue
         if bid in seen_ids or tok in seen_tokens: skipped += 1; continue
@@ -3087,16 +3210,11 @@ async def stop_all_user_bots():
             try: await child.session.close()
             except Exception: pass
         if task and not task.done():
-            task.cancel()
-            tasks.append(task)
+            task.cancel(); tasks.append(task)
     for t in tasks:
-        try:
-            await asyncio.wait_for(t, timeout=5)
-        except Exception:
-            pass
-    running_user_bots.clear()
-    _running_tokens.clear()
-    _running_bids.clear()
+        try: await asyncio.wait_for(t, timeout=5)
+        except Exception: pass
+    running_user_bots.clear(); _running_tokens.clear(); _running_bids.clear()
     logger.info("✅ Все зеркала остановлены.")
 
 
@@ -3104,102 +3222,58 @@ async def stop_all_user_bots():
 # MAIN
 # ============================================================
 def _install_signal_handlers(shutdown_event: asyncio.Event):
-    """Сигналы устанавливаются в актуальном loop'е, event передаётся снаружи."""
     try:
         loop = asyncio.get_running_loop()
         def _stop():
-            logger.info("Получен сигнал остановки.")
-            shutdown_event.set()
+            logger.info("Получен сигнал остановки."); shutdown_event.set()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, _stop)
-            except NotImplementedError:
-                pass
+            try: loop.add_signal_handler(sig, _stop)
+            except NotImplementedError: pass
     except Exception as ex:
         logger.debug(f"signal handlers: {ex}")
 
 
 async def main():
     global BOT_USERNAME
-
-    # 1) Инициализация БД
     await init_db()
-
-    # 2) Узнаём username основного бота
     try:
         me = await bot.get_me()
         BOT_USERNAME = me.username or BOT_USERNAME
         logger.info(f"🤖 Бот: @{BOT_USERNAME}")
-    except Exception as ex:
-        logger.warning(f"get_me: {ex}")
-
-    # 3) Создаём Event ВНУТРИ loop'а (важно для Python 3.9!)
+    except Exception as ex: logger.warning(f"get_me: {ex}")
     shutdown_event = asyncio.Event()
-
-    # 4) Ставим обработчики сигналов (передаём event)
     _install_signal_handlers(shutdown_event)
-
-    # 5) Собираем главный Dispatcher
-    main_dp = Dispatcher(storage=MemoryStorage())
+    main_dp = Dispatcher(storage=make_storage())
+    main_dp.update.middleware(AntiSpamMiddleware())
     main_dp.update.middleware(SubscriptionMiddleware(CHANNELS, ADMINS))
     main_dp.include_router(create_router())
-
-    # 6) Запускаем зеркала фоном
     mirrors_task = asyncio.create_task(start_all_user_bots(), name="mirrors")
-
-    # 7) Запускаем главный polling (long-running)
-    polling_task = asyncio.create_task(
-        safe_start_polling(main_dp, bot, label="main"),
-        name="main_polling",
-    )
-
-    # 8) Задача, которая ждёт сигнал остановки
+    polling_task = asyncio.create_task(safe_start_polling(main_dp, bot, label="main"), name="main_polling")
     stop_task = asyncio.create_task(shutdown_event.wait(), name="stop_wait")
-
-    # 9) Ждём: либо polling сам упал/завершился, либо сигнал остановки
     try:
-        done, pending = await asyncio.wait(
-            {polling_task, stop_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        done, pending = await asyncio.wait({polling_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
         done, pending = set(), {polling_task, stop_task}
-
     logger.info("Начинаю остановку...")
-
-    # 10) Отменяем всё, что осталось
-    for t in pending:
-        t.cancel()
+    for t in pending: t.cancel()
     for t in list(pending) + [mirrors_task]:
-        if t.done():
-            continue
+        if t.done(): continue
         t.cancel()
-        try:
-            await t
-        except (asyncio.CancelledError, Exception):
-            pass
-
-    # 11) Дочитываем исключения из завершённых тасок (чтобы не было "never retrieved")
+        try: await t
+        except (asyncio.CancelledError, Exception): pass
     for t in done:
         try:
             exc = t.exception()
             if exc and not isinstance(exc, asyncio.CancelledError):
                 logger.error(f"Задача {t.get_name()} упала: {exc!r}")
-        except (asyncio.CancelledError, Exception):
-            pass
-
-    # 12) Гасим зеркала и сессии
+        except (asyncio.CancelledError, Exception): pass
     logger.info("Останавливаю зеркала...")
     await stop_all_user_bots()
     await close_session()
-    try:
-        await bot.session.close()
-    except Exception:
-        pass
-    try:
-        await main_dp.storage.close()
-    except Exception:
-        pass
+    try: await bot.session.close()
+    except Exception: pass
+    try: await main_dp.storage.close()
+    except Exception: pass
     logger.info("✅ Всё остановлено.")
 
 
@@ -3207,22 +3281,8 @@ if __name__ == "__main__":
     if not acquire_single_instance_lock():
         logger.error("❌ Другой экземпляр бота уже запущен!")
         sys.exit(1)
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен.")
-    finally:
-        release_single_instance_lock()
-
-if __name__ == "__main__":
-    if not acquire_single_instance_lock():
-        logger.error("❌ Другой экземпляр бота уже запущен!")
-        sys.exit(1)
-
-    # Flask в фоне — чтобы Render видел открытый порт
     threading.Thread(target=run_flask, daemon=True).start()
     logger.info("✅ Flask health-check запущен в фоне.")
-
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
