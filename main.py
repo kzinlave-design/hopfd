@@ -1,4 +1,4 @@
-# main.py — Crusty Search (monolith, persistent FSM, chain hotfix)
+# main.py — Crusty Search (persistent FSM + новый chain.html)
 import threading
 from flask import Flask
 import asyncio, aiosqlite, random, re, os, sys, logging, json, hashlib, signal, time, pickle
@@ -189,11 +189,9 @@ def fmt_crypto(a, c):
 
 
 # ============================================================
-# FSM STORAGE — persistent (Redis если есть, иначе SQLite)
+# FSM STORAGE — Redis если задан, иначе SQLite
 # ============================================================
 class SQLiteStorage(BaseStorage):
-    """Простое persistent-хранилище FSM поверх SQLite (fsm.db)."""
-
     def __init__(self, path: str = FSM_DB_PATH):
         self.path = path
         self._ready = False
@@ -227,8 +225,7 @@ class SQLiteStorage(BaseStorage):
             await db.execute(
                 "INSERT INTO fsm_storage (key, state) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET state=excluded.state, updated_at=CURRENT_TIMESTAMP",
-                (k, state_str),
-            )
+                (k, state_str))
             await db.commit()
         finally:
             await db.close()
@@ -247,15 +244,13 @@ class SQLiteStorage(BaseStorage):
         k = self._key_str(key)
         try: blob = pickle.dumps(data)
         except Exception as ex:
-            logger.warning(f"[fsm] pickle fail: {ex}")
-            blob = pickle.dumps({})
+            logger.warning(f"[fsm] pickle fail: {ex}"); blob = pickle.dumps({})
         db = await self._connect()
         try:
             await db.execute(
                 "INSERT INTO fsm_storage (key, data) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET data=excluded.data, updated_at=CURRENT_TIMESTAMP",
-                (k, blob),
-            )
+                (k, blob))
             await db.commit()
         finally:
             await db.close()
@@ -266,8 +261,7 @@ class SQLiteStorage(BaseStorage):
         try:
             cur = await db.execute("SELECT data FROM fsm_storage WHERE key=?", (k,))
             row = await cur.fetchone()
-            if not row or not row[0]:
-                return {}
+            if not row or not row[0]: return {}
             try: return pickle.loads(row[0])
             except Exception: return {}
         finally:
@@ -278,15 +272,9 @@ class SQLiteStorage(BaseStorage):
 
 
 def make_storage():
-    """
-    1) Redis (если REDIS_URL) — переживает рестарт Render.
-    2) SQLite (fsm.db) — тоже переживает рестарт (файл на диске).
-    """
     redis_url = os.environ.get("REDIS_URL")
     if not redis_url:
-        # ── ВСТАВЬ СЮДА СВОЙ URL ИЗ UPSTASH ──
-        redis_url = "rediss://default:gQAAAAAAAxDKAAIgcDE0ZjQ2NmViNGE0NDM0ZDVhYWUzNTBmMTcwZjU3NThiNg@present-sunfish-200906.upstash.io:6379"
-
+        redis_url = "rediss://default:ТВОЙ_ТОКЕН@present-sunfish-200906.upstash.io:6379"
     if redis_url:
         try:
             from aiogram.fsm.storage.redis import RedisStorage
@@ -346,8 +334,7 @@ async def get_session():
             if _HTTP_SESSION is None or _HTTP_SESSION.closed:
                 conn = aiohttp.TCPConnector(
                     ssl=_ssl_ctx, limit=HTTP_LIMIT, limit_per_host=HTTP_LIMIT_PER_HOST,
-                    ttl_dns_cache=HTTP_TTL_DNS, enable_cleanup_closed=True,
-                )
+                    ttl_dns_cache=HTTP_TTL_DNS, enable_cleanup_closed=True)
                 _HTTP_SESSION = aiohttp.ClientSession(
                     timeout=aiohttp.ClientTimeout(total=25, connect=8, sock_read=20),
                     connector=conn,
@@ -358,8 +345,7 @@ async def get_session():
                         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
                         "Accept-Encoding": "gzip, deflate",
-                    },
-                )
+                    })
     return _HTTP_SESSION
 
 
@@ -715,7 +701,9 @@ def build_chain_data(data: dict, query: str, qtype_name: str = "") -> dict:
             "created": datetime.now().strftime("%d.%m.%Y %H:%M")}
 
 
-# ==== Шаблон chain.html (полностью вшит) ====
+# ============================================================
+# НОВЫЙ chain.html (полностью вшит, плейсхолдер __DATA_JSON__)
+# ============================================================
 _CHAIN_HTML_TPL = r'''<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -724,42 +712,45 @@ _CHAIN_HTML_TPL = r'''<!DOCTYPE html>
 <meta name="theme-color" content="#16181c">
 <title>CrustyChain</title>
 <style>
-:root{
-  --bg:#f6f7f9; --dot:#d9dce2; --box:#fff; --line:#c3c7ce; --border:#d3d6dc;
-  --text:#2b2f36; --hint:#9aa0aa; --focus:#4a6cf7;
-}
-@media (prefers-color-scheme:dark){
-  :root{--bg:#16181c; --dot:#262a31; --box:#20242a; --line:#4a505b; --border:#383d46; --text:#e6e8ec; --hint:#6b7280; --focus:#7f97ff;}
-}
+:root{--bg:#f6f7f9;--dot:#d9dce2;--box:#fff;--line:#c3c7ce;--border:#d3d6dc;--text:#2b2f36;--hint:#9aa0aa;--focus:#4a6cf7}
+@media (prefers-color-scheme:dark){:root{--bg:#16181c;--dot:#262a31;--box:#20242a;--line:#4a505b;--border:#383d46;--text:#e6e8ec;--hint:#6b7280;--focus:#7f97ff}}
 *{box-sizing:border-box}
 html,body{height:100%;margin:0}
 body{background:var(--bg);color:var(--text);font:13px/1.3 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;display:flex;flex-direction:column}
-header{padding:calc(12px + env(safe-area-inset-top,0px)) calc(16px + env(safe-area-inset-right,0px)) 12px calc(16px + env(safe-area-inset-left,0px));display:flex;gap:12px;align-items:center;justify-content:space-between}
-.tools{display:flex;gap:8px}
+header{padding:calc(10px + env(safe-area-inset-top,0px)) calc(16px + env(safe-area-inset-right,0px)) 10px calc(16px + env(safe-area-inset-left,0px));display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}
 h1{font-size:16px;font-weight:600;margin:0}
+.tools{display:flex;gap:8px;flex-wrap:wrap}
 button{min-width:40px;min-height:36px;font:inherit;color:var(--text);background:var(--box);border:1px solid var(--border);border-radius:5px;padding:5px 10px;cursor:pointer}
 button:hover{border-color:var(--focus)}
-.wrap{flex:1;min-height:0;overflow:auto;-webkit-overflow-scrolling:touch;padding-bottom:env(safe-area-inset-bottom,0px);background-image:radial-gradient(var(--dot) 1px,transparent 1px);background-size:18px 18px}
-.wrap{cursor:grab}
-.wrap.pan{cursor:grabbing;user-select:none}
+#self{border-color:var(--focus)}
+.wrap{flex:1;min-height:0;overflow:auto;-webkit-overflow-scrolling:touch;padding-bottom:env(safe-area-inset-bottom,0px);background-image:radial-gradient(var(--dot) 1px,transparent 1px);background-size:18px 18px;cursor:grab;-webkit-touch-callout:none;-webkit-user-select:none;user-select:none}
+.wrap.pan{cursor:grabbing}
 #sizer{position:relative}
 #board{position:absolute;left:0;top:0;width:3000px;height:2000px;transform-origin:0 0}
 svg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
 path{fill:none;stroke:var(--line);stroke-width:1.6}
 .arrow{fill:var(--line);stroke:none}
-.node{position:absolute;height:30px;background:var(--box);border:1px solid var(--border);border-radius:5px;
-  padding:7px 8px;font-size:11px;white-space:nowrap;overflow:hidden;outline:none;cursor:grab;
-  box-shadow:0 1px 2px rgba(0,0,0,.05);touch-action:none;user-select:none;-webkit-user-select:none}
-.node:empty::before{content:attr(data-hint);color:var(--hint)}
-@media (pointer:coarse){.node[contenteditable=true]{font-size:16px}}
+.node{position:absolute;min-height:30px;background:var(--box);border:1px solid var(--border);border-radius:5px;padding:7px 8px;font-size:11px;white-space:pre-wrap;word-break:break-word;overflow:hidden;outline:none;cursor:grab;box-shadow:0 1px 2px rgba(0,0,0,.05);touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+.node:empty::before,.pbox:empty::before{content:attr(data-hint);color:var(--hint)}
+.node.img{padding:4px}
+.node img{display:block;width:100%;height:auto;border-radius:3px;pointer-events:none;-webkit-user-drag:none}
+.node.linking{border-color:var(--focus);border-style:dashed}
 .node.drag{cursor:grabbing;box-shadow:0 6px 16px rgba(0,0,0,.18);z-index:5}
 .node[contenteditable=true]{cursor:text;user-select:text;-webkit-user-select:text;border-color:var(--focus);box-shadow:0 0 0 2px color-mix(in srgb,var(--focus) 25%,transparent)}
+@media (pointer:coarse){.node[contenteditable=true]{font-size:16px}}
+#menu{position:fixed;z-index:50;min-width:230px;background:var(--box);border:1px solid var(--border);border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.25);padding:4px}
+#menu[hidden],#pd[hidden]{display:none}
+#menu button{display:block;width:100%;text-align:left;border:0;background:none;padding:11px 14px;font-size:14px;border-radius:7px}
+#menu button:hover,#menu button:active{background:color-mix(in srgb,var(--focus) 14%,transparent)}
+#pd{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;padding:20px}
+.pbox{width:min(320px,100%);min-height:110px;max-height:50vh;overflow:auto;background:var(--box);border:1px solid var(--focus);border-radius:10px;padding:12px;font-size:16px;outline:none;user-select:text;-webkit-user-select:text}
 </style>
 </head>
 <body>
 <header>
   <h1>CrustyChain</h1>
   <div class="tools">
+    <button id="self">Самоцепочка</button>
     <button id="zout" aria-label="Уменьшить">−</button>
     <button id="zin" aria-label="Увеличить">+</button>
     <button id="reset">Сбросить</button>
@@ -773,151 +764,366 @@ path{fill:none;stroke:var(--line);stroke-width:1.6}
       </marker></defs></svg>
   </div></div>
 </div>
+<div id="menu" hidden></div>
+<div id="pd" hidden><div class="pbox" contenteditable="true" data-hint="Вставьте сюда"></div></div>
+<input type="file" id="file" accept="image/*" hidden>
 <script>
-const board = document.getElementById('board');
-const svg = document.getElementById('lines');
-const W = 130, H = 30, CY = 1000, OX = 940, BW = 3000, BH = 2000;
-const nodes = [], edges = [];
-const wrap = document.querySelector('.wrap'), sizer = document.getElementById('sizer');
-let scale = 1;
+const DATA = __DATA_JSON__;
+const $ = id => document.getElementById(id);
+const board = $('board'), svg = $('lines'), wrap = document.querySelector('.wrap'), sizer = $('sizer'), menu = $('menu'), pd = $('pd'), pbox = pd.firstChild, fileIn = $('file');
+const W = 130, H = 30, CW = 160, CY = 1000, OX = 940, BW = 3000, BH = 2000, KEY = 'crustychain.v1';
+let nodes = [], edges = [], scale = 1, custom = false, tail = null, linkFrom = null, ctx = null, openedAt = 0, lastType = 'mouse', st, dataLoaded = false;
+
 function setScale(v){
   scale = Math.min(1.6, Math.max(0.3, v));
   board.style.transform = `scale(${scale})`;
   sizer.style.width = BW * scale + 'px';
   sizer.style.height = BH * scale + 'px';
 }
-setScale(wrap.clientWidth < 800 ? Math.max(0.5, wrap.clientWidth / 1400 * 1.6) : 1);
 function center(){
   wrap.scrollLeft = BW / 2 * scale - wrap.clientWidth / 2;
   wrap.scrollTop = CY * scale - wrap.clientHeight / 2;
 }
-requestAnimationFrame(center);
-document.getElementById('zin').onclick = () => setScale(scale * 1.2);
-document.getElementById('zout').onclick = () => setScale(scale / 1.2);
-function node(x, cy, w, hint){
+setScale(wrap.clientWidth < 800 ? Math.max(0.5, wrap.clientWidth / 1400 * 1.6) : 1);
+$('zin').onclick = () => setScale(scale * 1.2);
+$('zout').onclick = () => setScale(scale / 1.2);
+
+const hOf = n => n.el.offsetHeight || H;
+function place(n, x, y){ n.x = x; n.y = y; n.el.style.left = x + 'px'; n.el.style.top = y + 'px'; }
+function mk(x, y, w, hint){
   const el = document.createElement('div');
-  el.className = 'node';
-  el.dataset.hint = hint || '';
-  el.style.width = w + 'px';
-  const n = {el, w, x0: x + OX, y0: cy - H/2};
-  place(n, n.x0, n.y0);
-  board.appendChild(el);
-  nodes.push(n);
-  bindDrag(n);
+  el.className = 'node'; el.dataset.hint = hint || ''; el.style.width = w + 'px';
+  const n = {el, w, x0: x, y0: y, text: '', img: null};
+  el.__n = n; place(n, x, y); board.appendChild(el); nodes.push(n); bindDrag(n);
   return n;
-}
-function place(n, x, y){
-  n.x = x; n.y = y;
-  n.el.style.left = x + 'px';
-  n.el.style.top = y + 'px';
-}
-function column(x, count, gap, hint){
-  const top = CY - (count - 1) * gap / 2;
-  return Array.from({length: count}, (_, i) => node(x, top + i * gap, W, hint));
 }
 function link(a, b, type){
   const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
   p.setAttribute('marker-end', 'url(#ah)');
   svg.appendChild(p);
-  edges.push({a, b, type, p});
+  edges.push({a, b, type: type || 'auto', p});
+}
+const findEdge = (a, b) => edges.find(e => (e.a === a && e.b === b) || (e.a === b && e.b === a));
+function toggleLink(a, b){
+  const e = findEdge(a, b);
+  if (e){ e.p.remove(); edges.splice(edges.indexOf(e), 1); } else link(a, b);
+  draw(); save();
+}
+function anchor(n, s){
+  const h = hOf(n);
+  if (s === 'r') return {x: n.x + n.w, y: n.y + h/2, nx: 1, ny: 0};
+  if (s === 'l') return {x: n.x, y: n.y + h/2, nx: -1, ny: 0};
+  if (s === 'b') return {x: n.x + n.w/2, y: n.y + h, nx: 0, ny: 1};
+  return {x: n.x + n.w/2, y: n.y, nx: 0, ny: -1};
+}
+function sides(a, b, t){
+  if (t === 'h') return ['r', 'l'];
+  if (t === 'v') return ['b', 't'];
+  const dx = (b.x + b.w/2) - (a.x + a.w/2), dy = (b.y + hOf(b)/2) - (a.y + hOf(a)/2);
+  if (Math.abs(dx) >= Math.abs(dy)) return dx >= 0 ? ['r', 'l'] : ['l', 'r'];
+  return dy >= 0 ? ['b', 't'] : ['t', 'b'];
 }
 function draw(){
   for (const {a, b, type, p} of edges){
-    let d;
-    if (type === 'v'){
-      const x1 = a.x + a.w/2, y1 = a.y + H, x2 = b.x + b.w/2, y2 = b.y - 2;
-      const dy = Math.max(Math.abs(y2 - y1) * 0.5, 10);
-      d = `M${x1} ${y1} C${x1} ${y1+dy} ${x2} ${y2-dy} ${x2} ${y2}`;
-    } else {
-      const x1 = a.x + a.w, y1 = a.y + H/2, x2 = b.x - 2, y2 = b.y + H/2;
-      const dx = Math.max(Math.abs(x2 - x1) * 0.5, 30);
-      d = `M${x1} ${y1} C${x1+dx} ${y1} ${x2-dx} ${y2} ${x2} ${y2}`;
-    }
-    p.setAttribute('d', d);
+    const [sa, sb] = sides(a, b, type), A = anchor(a, sa), B = anchor(b, sb);
+    const ex = B.x + B.nx * 2, ey = B.y + B.ny * 2;
+    const d = Math.max((A.nx ? Math.abs(ex - A.x) : Math.abs(ey - A.y)) * 0.5, 30);
+    p.setAttribute('d', `M${A.x} ${A.y} C${A.x + A.nx*d} ${A.y + A.ny*d} ${ex + B.nx*d} ${ey + B.ny*d} ${ex} ${ey}`);
   }
 }
+function setText(n, t){
+  n.img = null; n.text = t; n.el.classList.remove('img'); n.el.textContent = t; draw(); save();
+}
+function setImg(n, src){
+  n.img = src; n.text = ''; n.el.classList.add('img');
+  const im = new Image(); im.draggable = false; im.onload = draw; im.src = src;
+  n.el.replaceChildren(im); draw(); save();
+}
+function delNode(n){
+  edges.filter(e => e.a === n || e.b === n).forEach(e => { e.p.remove(); edges.splice(edges.indexOf(e), 1); });
+  n.el.remove(); nodes.splice(nodes.indexOf(n), 1);
+  if (tail === n) tail = null;
+  if (linkFrom === n) linkFrom = null;
+  draw(); save();
+}
+function setLinkFrom(n){
+  if (linkFrom) linkFrom.el.classList.remove('linking');
+  linkFrom = n; if (n) n.el.classList.add('linking');
+}
+function startEdit(n){
+  if (n.img) setText(n, '');
+  const el = n.el; el.contentEditable = 'true'; el.focus();
+  const r = document.createRange(); r.selectNodeContents(el); r.collapse(false);
+  const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+}
+
 function bindDrag(n){
-  const el = n.el;
-  let sx, sy, ox, oy, moved, id;
+  const el = n.el; let sx, sy, ox, oy, moved, id = null, lp = false, t;
   el.addEventListener('pointerdown', e => {
-    if (el.isContentEditable) return;
+    if (el.isContentEditable || (e.pointerType !== 'touch' && e.button !== 0)) return;
     id = e.pointerId; el.setPointerCapture(id);
-    sx = e.clientX; sy = e.clientY; ox = n.x; oy = n.y; moved = false;
+    sx = e.clientX; sy = e.clientY; ox = n.x; oy = n.y; moved = false; lp = false;
+    if (e.pointerType === 'touch'){
+      clearTimeout(t);
+      t = setTimeout(() => { if (id != null && !moved){ lp = true; openMenu(sx, sy, n); } }, 500);
+    }
   });
   el.addEventListener('pointermove', e => {
-    if (id == null || el.isContentEditable) return;
+    if (id == null || lp || el.isContentEditable) return;
     const dx = (e.clientX - sx) / scale, dy = (e.clientY - sy) / scale;
-    if (!moved && Math.hypot(dx, dy) < 4) return;
-    moved = true; el.classList.add('drag');
-    place(n, Math.min(BW - n.w, Math.max(0, ox + dx)), Math.min(BH - H, Math.max(0, oy + dy)));
+    if (!moved && Math.hypot(dx, dy) * scale < 6) return;
+    moved = true; clearTimeout(t); el.classList.add('drag');
+    place(n, Math.min(BW - n.w, Math.max(0, ox + dx)), Math.min(BH - hOf(n), Math.max(0, oy + dy)));
     draw();
   });
   const end = () => {
     if (id == null) return;
-    id = null; el.classList.remove('drag');
-    if (!moved){
-      el.contentEditable = 'true';
-      el.focus();
-      const r = document.createRange(); r.selectNodeContents(el); r.collapse(false);
-      const s = getSelection(); s.removeAllRanges(); s.addRange(r);
-    }
+    id = null; clearTimeout(t); el.classList.remove('drag');
+    if (moved){ save(); return; }
+    if (lp){ lp = false; return; }
+    if (linkFrom){ if (linkFrom !== n) toggleLink(linkFrom, n); setLinkFrom(null); return; }
+    if (!n.img) startEdit(n);
   };
   el.addEventListener('pointerup', end);
   el.addEventListener('pointercancel', end);
-  el.addEventListener('blur', () => { el.contentEditable = 'false'; });
-  el.addEventListener('keydown', e => { if (e.key === 'Enter'){ e.preventDefault(); el.blur(); } });
+  el.addEventListener('blur', () => { el.contentEditable = 'false'; if (!n.img) n.text = el.textContent; draw(); save(); });
+  el.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); el.blur(); } });
 }
+
 (() => {
-  let p = null;
+  let p = null, wt, lx, ly;
   wrap.addEventListener('pointerdown', e => {
-    if (e.pointerType === 'touch' || e.button !== 0 || e.target.closest('.node, button')) return;
+    if (e.target.closest('.node, button')) return;
+    setLinkFrom(null);
+    if (e.pointerType === 'touch'){
+      lx = e.clientX; ly = e.clientY; clearTimeout(wt);
+      wt = setTimeout(() => openMenu(lx, ly, null), 500);
+      return;
+    }
+    if (e.button !== 0) return;
     p = {x: e.clientX, y: e.clientY, l: wrap.scrollLeft, t: wrap.scrollTop};
-    wrap.setPointerCapture(e.pointerId);
-    wrap.classList.add('pan');
+    wrap.setPointerCapture(e.pointerId); wrap.classList.add('pan');
   });
   wrap.addEventListener('pointermove', e => {
+    if (e.pointerType === 'touch' && Math.hypot(e.clientX - lx, e.clientY - ly) > 8) clearTimeout(wt);
     if (!p) return;
     wrap.scrollLeft = p.l - (e.clientX - p.x);
     wrap.scrollTop = p.t - (e.clientY - p.y);
   });
-  const stop = () => { p = null; wrap.classList.remove('pan'); };
+  const stop = () => { p = null; clearTimeout(wt); wrap.classList.remove('pan'); };
   wrap.addEventListener('pointerup', stop);
   wrap.addEventListener('pointercancel', stop);
 })();
 
-// === ДАННЫЕ ИЗ БОТА ===
-const DATA = __DATA_JSON__;
-function safeText(s){ return String(s == null ? '—' : s).slice(0, 40); }
-function kvText(d){ return d ? safeText(d.k + ': ' + d.v) : '—'; }
+document.addEventListener('pointerdown', e => {
+  lastType = e.pointerType;
+  if (!menu.hidden && !menu.contains(e.target)) closeMenu();
+}, true);
+wrap.addEventListener('contextmenu', e => {
+  const el = e.target.closest('.node');
+  if (el && el.isContentEditable) return;
+  e.preventDefault();
+  if (lastType === 'touch') return;
+  openMenu(e.clientX, e.clientY, el ? el.__n : null);
+});
+wrap.addEventListener('scroll', closeMenu);
+function closeMenu(){ menu.hidden = true; ctx = null; }
+function openMenu(x, y, n){
+  ctx = {x, y, n};
+  const items = [['t', 'Написать текст'], ['p', 'Вставить из буфера обмена'], ['i', 'Поставить фото']];
+  if (n) items.push(['c', 'Соединить / разъединить'], ['d', 'Удалить блок']);
+  menu.replaceChildren(...items.map(([a, t]) => { const b = document.createElement('button'); b.dataset.act = a; b.textContent = t; return b; }));
+  menu.hidden = false; openedAt = Date.now();
+  menu.style.left = Math.max(8, Math.min(x, innerWidth - menu.offsetWidth - 8)) + 'px';
+  menu.style.top = Math.max(8, Math.min(y, innerHeight - menu.offsetHeight - 8)) + 'px';
+}
+menu.addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (!b || Date.now() - openedAt < 350) return;
+  const c = ctx; closeMenu(); act(b.dataset.act, c);
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape'){ closeMenu(); pd.hidden = true; } });
 
-const start = node(10, CY, 110, 'номер');
-start.el.textContent = safeText(DATA.root);
+function target(c){
+  if (c.n){ tail = c.n; return c.n; }
+  const r = board.getBoundingClientRect();
+  const x = Math.min(BW - CW, Math.max(0, (c.x - r.left) / scale - CW / 2));
+  const y = Math.min(BH - H, Math.max(0, (c.y - r.top) / scale - H / 2));
+  const n = mk(x, y, CW, 'пусто');
+  if (tail && nodes.includes(tail)) link(tail, n);
+  tail = n; return n;
+}
+function apply(c, v){
+  const n = target(c);
+  if (v.img) setImg(n, v.img); else setText(n, v.text.trim().slice(0, 400));
+}
+function act(a, c){
+  if (a === 't') startEdit(target(c));
+  else if (a === 'p') doPaste(c);
+  else if (a === 'i'){ pendingPhoto = c; fileIn.click(); }
+  else if (a === 'c') setLinkFrom(c.n);
+  else if (a === 'd') delNode(c.n);
+}
 
-const midCount = Math.max(DATA.mid.length, 7);
-const mid = column(320, midCount, 62, 'данные');
-mid.forEach((m, i) => { m.el.textContent = kvText(DATA.mid[i]); });
+let pendingPhoto = null;
+function shrink(file){
+  return new Promise((res, rej) => {
+    const u = URL.createObjectURL(file), im = new Image();
+    im.onload = () => {
+      const k = Math.min(1, 420 / Math.max(im.width, im.height)), cv = document.createElement('canvas');
+      cv.width = Math.round(im.width * k); cv.height = Math.round(im.height * k);
+      const g = cv.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, cv.width, cv.height);
+      g.drawImage(im, 0, 0, cv.width, cv.height); URL.revokeObjectURL(u);
+      res(cv.toDataURL('image/jpeg', .85));
+    };
+    im.onerror = rej; im.src = u;
+  });
+}
+fileIn.addEventListener('change', async () => {
+  const f = fileIn.files[0], c = pendingPhoto; fileIn.value = '';
+  if (!f || !c) return;
+  try { apply(c, {img: await shrink(f)}); } catch (e) {}
+});
+async function doPaste(c){
+  try {
+    if (navigator.clipboard && navigator.clipboard.read){
+      const items = await navigator.clipboard.read();
+      for (const it of items){
+        const t = it.types.find(t => t.startsWith('image/'));
+        if (t) return apply(c, {img: await shrink(await it.getType(t))});
+      }
+      for (const it of items){
+        if (it.types.includes('text/plain')){
+          const txt = await (await it.getType('text/plain')).text();
+          if (txt.trim()) return apply(c, {text: txt});
+        }
+      }
+    } else if (navigator.clipboard && navigator.clipboard.readText){
+      const txt = await navigator.clipboard.readText();
+      if (txt.trim()) return apply(c, {text: txt});
+    }
+  } catch (e) {}
+  pasteDialog(c);
+}
+function pasteDialog(c){
+  pbox.textContent = ''; pd.hidden = false; pbox.focus();
+  pd.onpointerdown = e => { if (e.target === pd) pd.hidden = true; };
+  pbox.onpaste = async e => {
+    e.preventDefault();
+    const cd = e.clipboardData, f = [...cd.files].find(f => f.type.startsWith('image/')), txt = cd.getData('text');
+    pd.hidden = true;
+    try {
+      if (f) apply(c, {img: await shrink(f)});
+      else if (txt.trim()) apply(c, {text: txt});
+    } catch (e) {}
+  };
+}
 
-const hub = node(520, CY, 110, 'адрес');
-hub.el.textContent = safeText(DATA.address);
+function save(){
+  if (!custom) return;
+  clearTimeout(st);
+  st = setTimeout(() => {
+    try {
+      localStorage.setItem(KEY, JSON.stringify({
+        nodes: nodes.map(n => ({x: n.x, y: n.y, w: n.w, text: n.text, img: n.img})),
+        edges: edges.map(e => [nodes.indexOf(e.a), nodes.indexOf(e.b)]),
+        tail: nodes.indexOf(tail)
+      }));
+    } catch (e) {}
+  }, 300);
+}
+function loadCustom(){
+  let d = null;
+  try { d = JSON.parse(localStorage.getItem(KEY)); } catch (e) {}
+  if (d && d.nodes && d.nodes.length){
+    d.nodes.forEach(o => { const n = mk(o.x, o.y, o.w, 'пусто'); if (o.img) setImg(n, o.img); else if (o.text) setText(n, o.text); });
+    d.edges.forEach(([i, j]) => { if (nodes[i] && nodes[j]) link(nodes[i], nodes[j]); });
+    tail = nodes[d.tail] || null;
+    return true;
+  }
+  return false;
+}
 
-const next = node(660, CY, 110, 'родители');
-next.el.textContent = safeText(DATA.parents);
+function buildSample(){
+  const nd = (x, cy, w, hint) => mk(x + OX, cy - H / 2, w, hint);
+  const col = (x, count, gap) => Array.from({length: count}, (_, i) => nd(x, CY - (count - 1) * gap / 2 + i * gap, W, 'пусто'));
+  const start = nd(10, CY, 110, 'начало'), mid = col(320, 7, 62), hub = nd(520, CY, 110, 'пусто'), next = nd(660, CY, 110, 'пусто'), right = col(930, 8, 56);
+  mid.forEach(m => link(start, m, 'h'));
+  mid.forEach((m, i) => { if (i < mid.length - 1) link(m, mid[i + 1], 'v'); });
+  mid.forEach(m => link(m, hub, 'h'));
+  link(hub, next, 'h');
+  right.forEach(r => link(next, r, 'h'));
+}
 
-const rightCount = Math.max(DATA.right.length, 8);
-const right = column(930, rightCount, 56, 'данные');
-right.forEach((r, i) => { r.el.textContent = kvText(DATA.right[i]); });
+/* === ЦЕПОЧКА ИЗ ДАННЫХ БОТА === */
+function buildFromBotData(){
+  if (typeof DATA === 'undefined' || !DATA || !DATA.root) return false;
+  const nd = (x, cy, w) => mk(x + OX, cy - H / 2, w, '');
+  const root = nd(10, CY, 110);
+  setText(root, String(DATA.root).slice(0, 40));
+  const midGap = 62, midCount = Math.max((DATA.mid || []).length, 7);
+  const midTop = CY - (midCount - 1) * midGap / 2;
+  const mid = [];
+  for (let i = 0; i < midCount; i++){
+    const n = nd(320, midTop + i * midGap, W);
+    const d = DATA.mid && DATA.mid[i];
+    setText(n, d ? (d.k + ': ' + d.v).slice(0, 40) : '—');
+    mid.push(n);
+  }
+  const hub = nd(520, CY, 110);
+  setText(hub, String(DATA.address || '—').slice(0, 40));
+  const next = nd(660, CY, 110);
+  setText(next, String(DATA.parents || '—').slice(0, 40));
+  const rightGap = 56, rightCount = Math.max((DATA.right || []).length, 8);
+  const rightTop = CY - (rightCount - 1) * rightGap / 2;
+  const right = [];
+  for (let i = 0; i < rightCount; i++){
+    const n = nd(930, rightTop + i * rightGap, W);
+    const d = DATA.right && DATA.right[i];
+    setText(n, d ? (d.k + ': ' + d.v).slice(0, 40) : '—');
+    right.push(n);
+  }
+  mid.forEach(m => link(root, m, 'h'));
+  mid.forEach((m, i) => { if (i < mid.length - 1) link(m, mid[i + 1], 'v'); });
+  mid.forEach(m => link(m, hub, 'h'));
+  link(hub, next, 'h');
+  right.forEach(r => link(next, r, 'h'));
+  return true;
+}
 
-mid.forEach(m => link(start, m));
-mid.forEach((m, i) => { if (i < mid.length - 1) link(m, mid[i + 1], 'v'); });
-mid.forEach(m => link(m, hub));
-link(hub, next);
-right.forEach(r => link(next, r));
-draw();
-document.getElementById('reset').onclick = () => {
-  nodes.forEach(n => place(n, n.x0, n.y0));
-  draw();
-  center();
+function enter(c){
+  custom = c;
+  nodes.forEach(n => n.el.remove()); edges.forEach(e => e.p.remove());
+  nodes = []; edges = []; tail = null; setLinkFrom(null); closeMenu();
+  if (c){
+    if (!dataLoaded && buildFromBotData()){
+      dataLoaded = true;
+    } else if (!loadCustom()){
+      tail = mk(BW / 2 - CW / 2, CY - H / 2, CW, 'начало');
+    }
+  } else {
+    buildSample();
+  }
+  $('self').textContent = c ? 'Пример' : 'Самоцепочка';
+  $('reset').textContent = c ? 'Очистить' : 'Сбросить';
+  draw(); center(); if (c) save();
+}
+$('self').onclick = () => enter(!custom);
+$('reset').onclick = () => {
+  if (!custom){ nodes.forEach(n => place(n, n.x0, n.y0)); draw(); center(); return; }
+  if (nodes.length > 1 && !confirm('Очистить цепочку?')) return;
+  try { localStorage.removeItem(KEY); } catch (e) {}
+  enter(true);
 };
+
+let saved = null;
+try { saved = localStorage.getItem(KEY); } catch (e) {}
+if (typeof DATA !== 'undefined' && DATA && DATA.root){
+  enter(true);
+} else {
+  enter(!!saved);
+}
+requestAnimationFrame(center);
 </script>
 </body>
 </html>'''
@@ -929,17 +1135,13 @@ def render_chain_html(chain: dict) -> str:
         try:
             with open(CHAIN_HTML_PATH, "r", encoding="utf-8") as f:
                 tpl = f.read()
+            if "__DATA_JSON__" not in tpl:
+                tpl = tpl.replace("</body>",
+                                  f"<script>const DATA = __DATA_JSON__;</script></body>")
         except Exception as ex:
-            logger.warning(f"[chain] не смог прочитать chain.html: {ex}")
-    data_json = json.dumps(chain, ensure_ascii=False)
-    js_data = f"const DATA = {data_json};"
-    # подставляем данные
-    tpl = tpl.replace("__DATA_JSON__", data_json)
-    tpl = tpl.replace("{{DATA_JSON}}", data_json)
-    # если шаблон не содержит DATA — допишем
-    if "const DATA =" not in tpl:
-        tpl = tpl.replace("</script>\n</body>", f"{js_data}\n</script>\n</body>")
-    return tpl
+            logger.warning(f"[chain] не смог прочитать chain.html: {ex}, использую вшитый")
+    data_json = json.dumps(chain, ensure_ascii=False) if chain else "null"
+    return tpl.replace("__DATA_JSON__", data_json)
 
 
 # ============================================================
@@ -1214,7 +1416,6 @@ def build_html_report(query, data, qtype_name="", username_result=None, self_bin
     emails_tags = "".join(f'<span class="tag">{esc(e)}</span>' for e in sorted(emails_all)) \
                   or '<span class="tag">email не найдены</span>'
 
-    # CSS — компактная версия (полный блок как в исходнике оставлен для совместимости)
     CSS = """
     body{margin:0;background:#050506;color:#f4f4f1;font:14px system-ui,sans-serif}
     .wrap{max-width:1240px;margin:auto;padding:20px}
@@ -1812,11 +2013,10 @@ _running_tokens = set()
 _running_bids = set()
 _running_lock = asyncio.Lock()
 
-# Персистентный кеш последнего пробива (JSON в FSM)
 async def save_user_result(state: FSMContext, payload: dict):
     try:
         s = json.dumps(payload, ensure_ascii=False)
-        if len(s) > 60000:  # слишком большой — не сохраняем
+        if len(s) > 60000:
             await state.update_data(last_result=None)
             return
         await state.update_data(last_result=s)
@@ -2272,7 +2472,7 @@ async def h_query(message: Message, state: FSMContext):
             await msg.edit_text(formatted, reply_markup=kb, parse_mode="HTML")
         except TelegramBadRequest:
             await message.answer(formatted, reply_markup=kb, parse_mode="HTML")
-        await state.set_state(None)  # не clear, чтобы сохранилось last_result
+        await state.set_state(None)
         return
 
     if qtype == "phone":
@@ -2339,7 +2539,7 @@ async def h_query(message: Message, state: FSMContext):
         await msg.edit_text(formatted, reply_markup=kb, parse_mode="HTML")
     except TelegramBadRequest:
         await message.answer(formatted, reply_markup=kb, parse_mode="HTML")
-    await state.set_state(None)  # не clear, чтобы сохранилось last_result
+    await state.set_state(None)
 
 
 async def h_download_html(cb: CallbackQuery, state: FSMContext):
@@ -3125,8 +3325,7 @@ async def safe_start_polling(dp: Dispatcher, bot_instance: Bot, label: str = "ma
                 bot_instance,
                 drop_pending_updates=True,
                 allowed_updates=dp.resolve_used_update_types(),
-                handle_signals=False,
-            )
+                handle_signals=False)
             return
         except TelegramConflictError as ex:
             last_exc = ex
@@ -3219,7 +3418,7 @@ async def stop_all_user_bots():
 
 
 # ============================================================
-# MAIN
+# MAIN + AUTO-START (gunicorn-friendly)
 # ============================================================
 def _install_signal_handlers(shutdown_event: asyncio.Event):
     try:
@@ -3276,9 +3475,7 @@ async def main():
     except Exception: pass
     logger.info("✅ Всё остановлено.")
 
-# ============================================================
-# AUTO-START (gunicorn mode + локальный запуск)
-# ============================================================
+
 _bot_started = False
 
 def _start_bot_in_background():
@@ -3310,5 +3507,6 @@ _start_bot_in_background()
 
 
 if __name__ == "__main__":
-    # Локально: python main.py — Flask не нужен, polling уже стартовал выше
+    # Локальный запуск: python main.py
+    # Flask не нужен (бот сам запустился выше), но оставим для совместимости
     run_flask()
