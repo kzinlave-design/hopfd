@@ -3276,16 +3276,42 @@ async def main():
     except Exception: pass
     logger.info("✅ Всё остановлено.")
 
+# ============================================================
+# AUTO-START (для gunicorn): polling в фоне при импорте модуля
+# ============================================================
+_bot_started = False
+
+def _start_bot_in_background():
+    """Запускает polling в отдельном потоке с собственным event loop."""
+    global _bot_started
+    if _bot_started:
+        return
+    _bot_started = True
+
+    def _runner():
+        if not acquire_single_instance_lock():
+            logger.error("❌ Другой экземпляр бота уже запущен!")
+            return
+        try:
+            asyncio.run(main())
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Бот остановлен.")
+        except Exception as ex:
+            logger.exception(f"[bot] fatal: {ex}")
+        finally:
+            release_single_instance_lock()
+
+    t = threading.Thread(target=_runner, daemon=True, name="bot-polling")
+    t.start()
+    logger.info("✅ Polling запущен в фоне (gunicorn mode).")
+
+
+# Запуск при импорте — чтобы gunicorn поднял и Flask, и бота
+_start_bot_in_background()
+
 
 if __name__ == "__main__":
-    if not acquire_single_instance_lock():
-        logger.error("❌ Другой экземпляр бота уже запущен!")
-        sys.exit(1)
-    threading.Thread(target=run_flask, daemon=True).start()
-    logger.info("✅ Flask health-check запущен в фоне.")
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен.")
-    finally:
+    # Локальный запуск: python crusty.py
+    # Flask не нужен (бот сам запустился выше), но оставим для совместимости
+    run_flask()
         release_single_instance_lock()
