@@ -3277,12 +3277,11 @@ async def main():
     logger.info("✅ Всё остановлено.")
 
 # ============================================================
-# AUTO-START (для gunicorn): polling в фоне при импорте модуля
+# AUTO-START (gunicorn mode + локальный запуск)
 # ============================================================
 _bot_started = False
 
 def _start_bot_in_background():
-    """Запускает polling в отдельном потоке с собственным event loop."""
     global _bot_started
     if _bot_started:
         return
@@ -3306,12 +3305,10 @@ def _start_bot_in_background():
     logger.info("✅ Polling запущен в фоне (gunicorn mode).")
 
 
-# Запуск при импорте — чтобы gunicorn поднял и Flask, и бота
+# Запуск polling при импорте — gunicorn поднимет Flask + бота
 _start_bot_in_background()
 
 
 if __name__ == "__main__":
-    # Локальный запуск: python crusty.py
-    # Flask не нужен (бот сам запустился выше), но оставим для совместимости
+    # Локально: python main.py — Flask не нужен, polling уже стартовал выше
     run_flask()
-        release_single_instance_lock()
